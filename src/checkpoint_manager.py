@@ -26,7 +26,14 @@ except ImportError:
 
 
 class CheckpointManager:
-    """Quadruple-redundancy checkpoint system for ZARX-1B training."""
+    """Quadruple-redundancy checkpoint system for ZARX-1B training.
+    
+    Storage failures are NON-BLOCKING - if Drive is full, training continues
+    with GitHub + HF fallbacks. The process NEVER stops due to storage issues.
+    """
+
+    # Track Drive health globally
+    _drive_working = True
 
     def __init__(
         self,
@@ -179,25 +186,34 @@ class CheckpointManager:
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
-        # === LAYER 2: GOOGLE DRIVE ===
+        # === LAYER 2: GOOGLE DRIVE (non-blocking) ===
         if "drive" in layers:
-            print(f"[CHECKPOINT] Copying to Google Drive...")
-            try:
-                drive_ckpt_dir = self.drive_dir / "checkpoints"
-                drive_ckpt_dir.mkdir(parents=True, exist_ok=True)
+            if not CheckpointManager._drive_working:
+                print(f"[CHECKPOINT] Skipping Drive (previously failed). Using GitHub+HF fallback.")
+            else:
+                print(f"[CHECKPOINT] Copying to Google Drive...")
+                try:
+                    drive_ckpt_dir = self.drive_dir / "checkpoints"
+                    drive_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-                drive_path = drive_ckpt_dir / filename
-                drive_latest = drive_ckpt_dir / "checkpoint-latest.pt"
-                drive_meta = drive_ckpt_dir / "training_metadata.json"
+                    drive_path = drive_ckpt_dir / filename
+                    drive_latest = drive_ckpt_dir / "checkpoint-latest.pt"
+                    drive_meta = drive_ckpt_dir / "training_metadata.json"
 
-                shutil.copy2(local_path, drive_path)
-                shutil.copy2(local_path, drive_latest)
-                shutil.copy2(meta_path, drive_meta)
+                    shutil.copy2(local_path, drive_path)
+                    shutil.copy2(local_path, drive_latest)
+                    shutil.copy2(meta_path, drive_meta)
 
-                self._cleanup_dir(drive_ckpt_dir, self.keep_drive)
-                print(f"[CHECKPOINT] Drive save complete.")
-            except Exception as e:
-                print(f"[CHECKPOINT] Warning: Drive save failed: {e}")
+                    self._cleanup_dir(drive_ckpt_dir, self.keep_drive)
+                    print(f"[CHECKPOINT] Drive save complete.")
+                except OSError as e:
+                    if "No space left" in str(e) or "Quota exceeded" in str(e):
+                        print(f"[CHECKPOINT] DRIVE IS FULL! Disabling Drive saves. Using GitHub+HF fallback.")
+                        CheckpointManager._drive_working = False
+                    else:
+                        print(f"[CHECKPOINT] Warning: Drive save failed: {e}")
+                except Exception as e:
+                    print(f"[CHECKPOINT] Warning: Drive save failed: {e}")
 
         # === LAYER 3: GITHUB REPO ===
         if "github" in layers and self.github_token and self.github_repo:
