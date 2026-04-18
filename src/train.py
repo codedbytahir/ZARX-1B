@@ -289,17 +289,24 @@ def train(args):
 
     # ==================== WANDB ====================
 
+    wandb_run = None
     if WANDB_AVAILABLE and args.wandb_project:
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name or f"zarx-1b-pretrain",
-            config={
-                "model": config.__dict__,
-                "training": vars(args),
-            },
-            resume="allow",
-        )
-        wandb.watch(model, log="gradients", log_freq=100)
+        try:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name or f"zarx-1b-pretrain",
+                config={
+                    "model": config.__dict__,
+                    "training": vars(args),
+                },
+                resume="allow",
+            )
+            wandb.watch(model, log="gradients", log_freq=100)
+            wandb_run = wandb.run
+        except Exception as e:
+            print(f"[W&B] Warning: init failed: {e}")
+            print(f"[W&B] Training will continue WITHOUT W&B logging.")
+            wandb_run = None
 
     # ==================== TRAINING LOOP ====================
 
@@ -379,15 +386,18 @@ def train(args):
                 f"ETA: {elapsed/log_every * (total_steps-step) / 3600:.1f}h"
             )
 
-            if WANDB_AVAILABLE and args.wandb_project and wandb.run:
-                wandb.log({
-                    "train/loss": avg_loss,
-                    "train/lr": lr,
-                    "train/tokens": total_tokens,
-                    "train/tokens_per_sec": tokens_per_sec,
-                    "train/step": step,
-                    "train/progress": progress,
-                })
+            if WANDB_AVAILABLE and args.wandb_project and wandb_run is not None:
+                try:
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/lr": lr,
+                        "train/tokens": total_tokens,
+                        "train/tokens_per_sec": tokens_per_sec,
+                        "train/step": step,
+                        "train/progress": progress,
+                    })
+                except Exception:
+                    pass
 
             running_loss = 0.0
             step_start_time = time.time()
@@ -418,8 +428,11 @@ def train(args):
         model.save_pretrained(args.output_dir)
         print(f"Model saved to {args.output_dir}")
 
-    if WANDB_AVAILABLE and args.wandb_project and wandb.run:
-        wandb.finish()
+    if WANDB_AVAILABLE and args.wandb_project and wandb_run is not None:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
     print("\nZARX-1B training complete!")
 
