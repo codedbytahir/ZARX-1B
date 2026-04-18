@@ -3,9 +3,12 @@ ZARX-1B Bulletproof Checkpoint Manager
 Quadruple-redundancy system: Local + Google Drive + GitHub + HuggingFace Hub
 
 Layer 1: Local disk     — every 100 steps  (fast, survives within session)
-Layer 2: Google Drive   — every 500 steps  (survives Colab restarts)
+Layer 2: Google Drive   — every 500 steps  (survives Colab restarts, OPTIONAL if full)
 Layer 3: GitHub Repo    — every 1000 steps (survives EVERYTHING, version controlled)
 Layer 4: HuggingFace    — every 1000 steps (cross-platform, Kaggle compatible)
+
+DRIVE IS OPTIONAL — if Drive is full/unavailable, the process NEVER stops.
+It falls back to GitHub + HuggingFace automatically.
 """
 
 import torch
@@ -23,6 +26,9 @@ try:
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
+
+# GitHub file size limit (GitHub rejects >100MB without LFS)
+GITHUB_FILE_SIZE_LIMIT = 95 * 1024 * 1024  # 95MB with safety margin
 
 
 class CheckpointManager:
@@ -120,6 +126,22 @@ class CheckpointManager:
             print(f"[CHECKPOINT] Warning: GitHub repo init failed: {e}")
             self.github_token = None  # Disable GitHub pushes
 
+    def _check_drive_space(self, required_bytes: int) -> bool:
+        """Check if Drive has enough space for a write. Returns False if full."""
+        if not self.drive_dir.exists():
+            return False
+        try:
+            stat = shutil.disk_usage(str(self.drive_dir))
+            free_gb = stat.free / 1e9
+            required_gb = required_bytes / 1e9
+            # Need at least 500MB buffer
+            if stat.free < required_bytes + 500 * 1024 * 1024:
+                print(f"[CHECKPOINT] Drive low on space ({free_gb:.1f}GB free, need {required_gb:.1f}GB + 0.5GB buffer)")
+                return False
+            return True
+        except Exception:
+            return False
+
     def should_save(self, step: int) -> list:
         """Determine which layers need saving at this step."""
         layers = []
@@ -144,7 +166,7 @@ class CheckpointManager:
         val_loss: Optional[float] = None,
         extra_state: Optional[Dict] = None,
     ) -> None:
-        """Save checkpoint to all required layers."""
+        """Save checkpoint to all required layers. NON-BLOCKING - never stops the process."""
 
         layers = self.should_save(step)
         if not layers:
@@ -171,8 +193,27 @@ class CheckpointManager:
 
         # === LAYER 1: LOCAL (always save here first) ===
         print(f"[CHECKPOINT] Writing to local disk...")
-        torch.save(checkpoint, local_path)
-        torch.save(checkpoint, latest_path)
+        try:
+            torch.save(checkpoint, local_path)
+            torch.save(checkpoint, latest_path)
+        except Exception as e:
+            print(f"[CHECKPOINT] ERROR: Local save failed: {e}")
+            print(f"[CHECKPOINT] This is critical - local disk may be full!")
+            # Try to save a smaller version with just model weights
+            try:
+                minimal = {
+                    "step": step,
+                    "total_tokens": total_tokens,
+                    "train_loss": train_loss,
+                    "model_state_dict": checkpoint["model_state_dict"],
+                    "timestamp": checkpoint["timestamp"],
+                }
+                torch.save(minimal, local_path)
+                torch.save(minimal, latest_path)
+                print(f"[CHECKPOINT] Saved minimal checkpoint (no optimizer state)")
+            except Exception as e2:
+                print(f"[CHECKPOINT] CRITICAL: Even minimal save failed: {e2}")
+                return
 
         # Save lightweight metadata
         meta = {
@@ -183,13 +224,28 @@ class CheckpointManager:
             "timestamp": checkpoint["timestamp"],
         }
         meta_path = self.local_dir / "training_metadata.json"
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
+        try:
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+        except Exception:
+            pass
 
-        # === LAYER 2: GOOGLE DRIVE (non-blocking) ===
+        # Check file size for remote storage decisions
+        try:
+            file_size = local_path.stat().st_size
+        except Exception:
+            file_size = 0
+
+        # === LAYER 2: GOOGLE DRIVE (non-blocking, optional if full) ===
         if "drive" in layers:
             if not CheckpointManager._drive_working:
                 print(f"[CHECKPOINT] Skipping Drive (previously failed). Using GitHub+HF fallback.")
+            elif not self._check_drive_space(file_size):
+                print(f"[CHECKPOINT] Drive doesn't have enough space. Disabling Drive saves.")
+                CheckpointManager._drive_working = False
+                # Trigger GitHub+HF fallback since Drive is skipped
+                self._save_checkpoint_to_github(local_path, filename, meta, file_size)
+                self._save_checkpoint_to_hf(local_path, latest_path, meta_path, filename)
             else:
                 print(f"[CHECKPOINT] Copying to Google Drive...")
                 try:
@@ -207,54 +263,79 @@ class CheckpointManager:
                     self._cleanup_dir(drive_ckpt_dir, self.keep_drive)
                     print(f"[CHECKPOINT] Drive save complete.")
                 except OSError as e:
-                    if "No space left" in str(e) or "Quota exceeded" in str(e):
+                    error_str = str(e)
+                    if "No space left" in error_str or "Quota exceeded" in error_str or "ENOSPC" in error_str or "Device or resource busy" in error_str:
                         print(f"[CHECKPOINT] DRIVE IS FULL! Disabling Drive saves. Using GitHub+HF fallback.")
                         CheckpointManager._drive_working = False
+                        # Immediately push to GitHub+HF as fallback
+                        self._save_checkpoint_to_github(local_path, filename, meta, file_size)
+                        self._save_checkpoint_to_hf(local_path, latest_path, meta_path, filename)
                     else:
                         print(f"[CHECKPOINT] Warning: Drive save failed: {e}")
                 except Exception as e:
                     print(f"[CHECKPOINT] Warning: Drive save failed: {e}")
 
-        # === LAYER 3: GITHUB REPO ===
+        # === LAYER 3: GITHUB REPO (skip files >100MB, use HF instead) ===
         if "github" in layers and self.github_token and self.github_repo:
-            print(f"[CHECKPOINT] Pushing to GitHub ({self.github_repo})...")
-            try:
-                self._push_to_github(local_path, filename, meta)
-            except Exception as e:
-                print(f"[CHECKPOINT] Warning: GitHub push failed: {e}")
-                print(f"[CHECKPOINT] Local + Drive copies are safe. Will retry next cycle.")
+            self._save_checkpoint_to_github(local_path, filename, meta, file_size)
 
-        # === LAYER 4: HUGGINGFACE HUB ===
+        # === LAYER 4: HUGGINGFACE HUB (no size limit) ===
         if "hf" in layers and self.hf_api:
-            print(f"[CHECKPOINT] Pushing to HuggingFace Hub...")
-            try:
-                self.hf_api.upload_file(
-                    path_or_fileobj=str(local_path),
-                    path_in_repo=filename,
-                    repo_id=self.hf_repo_id,
-                    repo_type="model",
-                )
+            self._save_checkpoint_to_hf(local_path, latest_path, meta_path, filename)
+
+        # Cleanup local
+        self._cleanup_dir(self.local_dir, self.keep_local)
+        print(f"[CHECKPOINT] Step {step} saved successfully.")
+
+    def _save_checkpoint_to_github(self, local_path, filename, meta, file_size=0):
+        """Push checkpoint file to GitHub repo. Skips files >100MB."""
+        if not self.github_token or not self.github_repo:
+            return
+
+        if file_size > GITHUB_FILE_SIZE_LIMIT:
+            size_mb = file_size / 1e6
+            print(f"[CHECKPOINT] Skipping GitHub for {filename} ({size_mb:.0f}MB > 95MB limit). Use HF for large files.")
+            return
+
+        print(f"[CHECKPOINT] Pushing to GitHub ({self.github_repo})...")
+        try:
+            self._push_to_github(local_path, filename, meta)
+        except Exception as e:
+            print(f"[CHECKPOINT] Warning: GitHub push failed: {e}")
+            print(f"[CHECKPOINT] Local + HF copies are safe. Will retry next cycle.")
+
+    def _save_checkpoint_to_hf(self, local_path, latest_path, meta_path, filename):
+        """Push checkpoint to HuggingFace Hub. No size limit."""
+        if not self.hf_api or not self.hf_repo_id:
+            return
+
+        print(f"[CHECKPOINT] Pushing to HuggingFace Hub...")
+        try:
+            self.hf_api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=filename,
+                repo_id=self.hf_repo_id,
+                repo_type="model",
+            )
+            if latest_path.exists():
                 self.hf_api.upload_file(
                     path_or_fileobj=str(latest_path),
                     path_in_repo="checkpoint-latest.pt",
                     repo_id=self.hf_repo_id,
                     repo_type="model",
                 )
+            if meta_path.exists():
                 self.hf_api.upload_file(
                     path_or_fileobj=str(meta_path),
                     path_in_repo="training_metadata.json",
                     repo_id=self.hf_repo_id,
                     repo_type="model",
                 )
-                self._cleanup_hf(self.keep_hf)
-                print(f"[CHECKPOINT] HF Hub push complete!")
-            except Exception as e:
-                print(f"[CHECKPOINT] Warning: HF push failed: {e}")
-                print(f"[CHECKPOINT] Local + Drive + GitHub copies are safe. Will retry next cycle.")
-
-        # Cleanup local
-        self._cleanup_dir(self.local_dir, self.keep_local)
-        print(f"[CHECKPOINT] Step {step} saved successfully.")
+            self._cleanup_hf(self.keep_hf)
+            print(f"[CHECKPOINT] HF Hub push complete!")
+        except Exception as e:
+            print(f"[CHECKPOINT] Warning: HF push failed: {e}")
+            print(f"[CHECKPOINT] Local + GitHub copies are safe. Will retry next cycle.")
 
     def _push_to_github(self, local_path: Path, filename: str, meta: dict):
         """Push checkpoint file to GitHub repo."""
@@ -281,10 +362,14 @@ class CheckpointManager:
         subprocess.run(["git", "config", "user.email", "zarx-1b@training.bot"], cwd=str(github_dir), capture_output=True)
         subprocess.run(["git", "config", "user.name", "ZARX-1B Bot"], cwd=str(github_dir), capture_output=True)
         subprocess.run(["git", "add", "-A"], cwd=str(github_dir), capture_output=True)
-        subprocess.run(
+        commit_result = subprocess.run(
             ["git", "commit", "-m", f"checkpoint step {meta['latest_step']} | loss {meta['train_loss']:.4f} | tokens {meta['total_tokens']/1e9:.2f}B"],
             cwd=str(github_dir), capture_output=True
         )
+
+        # Only push if there's something to push
+        if commit_result.returncode != 0 and "nothing to commit" in commit_result.stdout.decode() if isinstance(commit_result.stdout, bytes) else commit_result.stdout:
+            return
 
         # Force push or regular push
         result = subprocess.run(
@@ -332,30 +417,186 @@ class CheckpointManager:
                 pass
 
     def save_data_to_drive(self, data_dir: str, label: str = "data"):
-        """Save entire data directory to Google Drive for persistence."""
+        """Save entire data directory to persistence layers. NON-BLOCKING.
+        Tries Drive first, falls back to GitHub + HF if Drive is full."""
+        src = Path(data_dir)
+        if not src.exists():
+            return False
+
+        # Calculate total size
         try:
-            drive_data_dir = self.drive_dir / label
-            if Path(data_dir).exists():
-                shutil.copytree(data_dir, str(drive_data_dir), dirs_exist_ok=True)
-                print(f"[PERSIST] Saved {data_dir} → Google Drive ({label})")
-                return True
-        except Exception as e:
-            print(f"[PERSIST] Warning: Could not save {label} to Drive: {e}")
+            total_size = sum(f.stat().st_size for f in src.rglob('*') if f.is_file())
+        except Exception:
+            total_size = 0
+
+        # === Try Drive first ===
+        if not CheckpointManager._drive_working:
+            print(f"[PERSIST] Skipping Drive for {label} (Drive previously failed)")
+        else:
+            try:
+                if total_size > 0 and not self._check_drive_space(total_size):
+                    print(f"[PERSIST] Drive doesn't have {total_size/1e9:.1f}GB for {label}. Falling back to GitHub+HF.")
+                    CheckpointManager._drive_working = False
+                else:
+                    drive_data_dir = self.drive_dir / label
+                    shutil.copytree(data_dir, str(drive_data_dir), dirs_exist_ok=True)
+                    print(f"[PERSIST] Saved {data_dir} -> Google Drive ({label})")
+                    return True
+            except OSError as e:
+                error_str = str(e)
+                if "No space left" in error_str or "Quota exceeded" in error_str or "ENOSPC" in error_str:
+                    print(f"[PERSIST] DRIVE IS FULL while saving {label}! Disabling Drive. Falling back to GitHub+HF.")
+                    CheckpointManager._drive_working = False
+                else:
+                    print(f"[PERSIST] Warning: Could not save {label} to Drive: {e}")
+            except Exception as e:
+                print(f"[PERSIST] Warning: Could not save {label} to Drive: {e}")
+
+        # === Fallback: Try GitHub (for small files only) ===
+        if self.github_token and self.github_repo:
+            try:
+                github_dir = getattr(self, 'github_local', None)
+                if github_dir and github_dir.exists():
+                    if src.is_dir():
+                        # Copy only files under 95MB
+                        small_files_count = 0
+                        for f in src.rglob('*'):
+                            if f.is_file() and f.stat().st_size <= GITHUB_FILE_SIZE_LIMIT:
+                                rel = f.relative_to(src)
+                                dest = github_dir / "data" / label / rel
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(str(f), str(dest))
+                                small_files_count += 1
+                        if small_files_count > 0:
+                            self._quick_github_push(f"add {label} data ({small_files_count} files)")
+                            print(f"[PERSIST] Pushed {label} to GitHub ({small_files_count} small files)")
+                    elif src.is_file() and src.stat().st_size <= GITHUB_FILE_SIZE_LIMIT:
+                        dest = github_dir / "data" / label / src.name
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(src), str(dest))
+                        self._quick_github_push(f"add {label}")
+                        print(f"[PERSIST] Pushed {label} to GitHub")
+            except Exception as e:
+                print(f"[PERSIST] GitHub fallback failed for {label}: {e}")
+
+        # === Fallback: Try HuggingFace (no size limit) ===
+        if self.hf_api and self.hf_repo_id:
+            try:
+                if src.is_dir():
+                    self.hf_api.upload_folder(
+                        folder_path=str(src),
+                        repo_id=self.hf_repo_id,
+                        repo_type="model",
+                        path_in_repo=f"data/{label}",
+                    )
+                    print(f"[PERSIST] Pushed {label} to HuggingFace Hub")
+                    return True
+                elif src.is_file():
+                    self.hf_api.upload_file(
+                        path_or_fileobj=str(src),
+                        path_in_repo=f"data/{label}/{src.name}",
+                        repo_id=self.hf_repo_id,
+                        repo_type="model",
+                    )
+                    print(f"[PERSIST] Pushed {src.name} to HuggingFace Hub")
+                    return True
+            except Exception as e:
+                print(f"[PERSIST] HF fallback failed for {label}: {e}")
+
+        print(f"[PERSIST] WARNING: All persistence layers failed for {label}. Data only on local disk.")
         return False
 
     def save_file_to_drive(self, filepath: str, label: str = ""):
-        """Save a single file to Google Drive."""
+        """Save a single file to persistence layers. NON-BLOCKING.
+        Tries Drive first, falls back to GitHub + HF if Drive is full."""
+        src = Path(filepath)
+        if not src.exists():
+            return False
+
         try:
-            src = Path(filepath)
-            if src.exists():
-                dest = self.drive_dir / label / src.name if label else self.drive_dir / src.name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(src), str(dest))
-                print(f"[PERSIST] Saved {src.name} → Google Drive")
+            file_size = src.stat().st_size
+        except Exception:
+            file_size = 0
+
+        # === Try Drive first ===
+        if not CheckpointManager._drive_working:
+            print(f"[PERSIST] Skipping Drive for {src.name} (Drive previously failed)")
+        else:
+            try:
+                if file_size > 0 and not self._check_drive_space(file_size):
+                    print(f"[PERSIST] Drive doesn't have space for {src.name}. Falling back to GitHub+HF.")
+                    CheckpointManager._drive_working = False
+                else:
+                    dest = self.drive_dir / label / src.name if label else self.drive_dir / src.name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src), str(dest))
+                    print(f"[PERSIST] Saved {src.name} -> Google Drive")
+                    return True
+            except OSError as e:
+                error_str = str(e)
+                if "No space left" in error_str or "Quota exceeded" in error_str or "ENOSPC" in error_str:
+                    print(f"[PERSIST] DRIVE IS FULL while saving {src.name}! Disabling Drive. Falling back to GitHub+HF.")
+                    CheckpointManager._drive_working = False
+                else:
+                    print(f"[PERSIST] Warning: Could not save {filepath} to Drive: {e}")
+            except Exception as e:
+                print(f"[PERSIST] Warning: Could not save {filepath} to Drive: {e}")
+
+        # === Fallback: Try GitHub ===
+        if self.github_token and self.github_repo:
+            try:
+                if file_size <= GITHUB_FILE_SIZE_LIMIT:
+                    github_dir = getattr(self, 'github_local', None)
+                    if github_dir and github_dir.exists():
+                        dest = github_dir / "data" / label / src.name if label else github_dir / src.name
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(src), str(dest))
+                        self._quick_github_push(f"add {src.name}")
+                        print(f"[PERSIST] Pushed {src.name} to GitHub")
+                else:
+                    size_mb = file_size / 1e6
+                    print(f"[PERSIST] Skipping GitHub for {src.name} ({size_mb:.0f}MB > 95MB limit). Use HF.")
+            except Exception as e:
+                print(f"[PERSIST] GitHub fallback failed for {src.name}: {e}")
+
+        # === Fallback: Try HuggingFace ===
+        if self.hf_api and self.hf_repo_id:
+            try:
+                path_in_repo = f"data/{label}/{src.name}" if label else src.name
+                self.hf_api.upload_file(
+                    path_or_fileobj=str(src),
+                    path_in_repo=path_in_repo,
+                    repo_id=self.hf_repo_id,
+                    repo_type="model",
+                )
+                print(f"[PERSIST] Pushed {src.name} to HuggingFace Hub")
                 return True
-        except Exception as e:
-            print(f"[PERSIST] Warning: Could not save {filepath} to Drive: {e}")
+            except Exception as e:
+                print(f"[PERSIST] HF fallback failed for {src.name}: {e}")
+
+        print(f"[PERSIST] WARNING: All persistence layers failed for {src.name}. File only on local disk.")
         return False
+
+    def _quick_github_push(self, commit_msg="update"):
+        """Quick git add/commit/push for the GitHub checkpoint repo."""
+        github_dir = getattr(self, 'github_local', None)
+        if not github_dir or not github_dir.exists():
+            return
+        auth_url = f"https://{self.github_token}@github.com/{self.github_repo}.git"
+        subprocess.run(["git", "config", "user.email", "zarx-1b@training.bot"],
+                      cwd=str(github_dir), capture_output=True)
+        subprocess.run(["git", "config", "user.name", "ZARX-1B Bot"],
+                      cwd=str(github_dir), capture_output=True)
+        subprocess.run(["git", "add", "-A"], cwd=str(github_dir), capture_output=True)
+        subprocess.run(["git", "commit", "-m", commit_msg],
+                      cwd=str(github_dir), capture_output=True)
+        result = subprocess.run(["git", "push", "origin", "main"],
+                              cwd=str(github_dir), capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            subprocess.run(["git", "remote", "set-url", "origin", auth_url],
+                          cwd=str(github_dir), capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "main"],
+                          cwd=str(github_dir), capture_output=True, text=True, timeout=120)
 
     def restore_from_drive(self, data_dir: str, label: str = "data"):
         """Restore data directory from Google Drive."""
@@ -363,10 +604,32 @@ class CheckpointManager:
             drive_data_dir = self.drive_dir / label
             if drive_data_dir.exists():
                 shutil.copytree(str(drive_data_dir), data_dir, dirs_exist_ok=True)
-                print(f"[RESTORE] Restored {label} from Google Drive → {data_dir}")
+                print(f"[RESTORE] Restored {label} from Google Drive -> {data_dir}")
                 return True
         except Exception as e:
             print(f"[RESTORE] Warning: Could not restore {label} from Drive: {e}")
+        return False
+
+    def restore_from_hf(self, data_dir: str, label: str = "data"):
+        """Restore data from HuggingFace Hub."""
+        if not HF_AVAILABLE or not self.hf_api or not self.hf_repo_id:
+            return False
+        try:
+            from huggingface_hub import snapshot_download
+            local_dir = snapshot_download(
+                repo_id=self.hf_repo_id,
+                allow_patterns=[f"data/{label}/*"],
+                repo_type="model",
+                token=self.hf_token,
+                local_dir="/tmp/hf_restore",
+            )
+            restore_src = Path("/tmp/hf_restore") / "data" / label
+            if restore_src.exists():
+                shutil.copytree(str(restore_src), data_dir, dirs_exist_ok=True)
+                print(f"[RESTORE] Restored {label} from HuggingFace Hub -> {data_dir}")
+                return True
+        except Exception as e:
+            print(f"[RESTORE] Warning: Could not restore {label} from HF: {e}")
         return False
 
     def load_latest(self) -> Optional[Dict]:

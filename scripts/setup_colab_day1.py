@@ -17,8 +17,8 @@ Run these cells first in your Colab notebook:
 
 Persistence Strategy (Drive is OPTIONAL - never blocks the process):
   1. Try Google Drive first (if available + has space)
-  2. Fall back to GitHub repo (always works if token provided)
-  3. Fall back to HuggingFace (if token provided)
+  2. Fall back to GitHub repo (for small files <95MB)
+  3. Fall back to HuggingFace (no size limit, best for large data)
   4. Local disk always works within the session
   THE PROCESS NEVER STOPS due to storage failures.
 """
@@ -34,6 +34,9 @@ from datetime import datetime
 
 # Track Drive availability globally
 DRIVE_WORKING = True
+
+# GitHub file size limit (GitHub rejects >100MB without LFS)
+GITHUB_FILE_SIZE_LIMIT = 95 * 1024 * 1024  # 95MB with safety margin
 
 
 def run(cmd, desc="", check=True):
@@ -56,6 +59,16 @@ def step(num, title):
     print(f"{'#'*60}")
 
 
+def _get_size(path):
+    """Get total size of a file or directory in bytes."""
+    src = Path(path)
+    if not src.exists():
+        return 0
+    if src.is_file():
+        return src.stat().st_size
+    return sum(f.stat().st_size for f in src.rglob('*') if f.is_file())
+
+
 def save_to_drive(src_path, drive_dir, label=""):
     """Save to Drive. NEVER raises - always returns True/False. Non-blocking."""
     global DRIVE_WORKING
@@ -70,14 +83,17 @@ def save_to_drive(src_path, drive_dir, label=""):
         # Check Drive space before attempting
         drive_path = Path(drive_dir)
         if drive_path.exists():
-            stat = shutil.disk_usage(str(drive_path))
-            free_gb = stat.free / 1e9
-            src_size = sum(f.stat().st_size for f in src.rglob('*') if f.is_file()) if src.is_dir() else src.stat().st_size
-            src_gb = src_size / 1e9
-            if free_gb < src_gb + 0.5:  # Need at least 500MB buffer
-                print(f"  [DRIVE] Not enough space ({free_gb:.1f}GB free, need {src_gb:.1f}GB). Skipping Drive.")
-                DRIVE_WORKING = False
-                return False
+            try:
+                stat = shutil.disk_usage(str(drive_path))
+                free_gb = stat.free / 1e9
+                src_size = _get_size(src)
+                src_gb = src_size / 1e9
+                if stat.free < src_size + 500 * 1024 * 1024:  # Need at least 500MB buffer
+                    print(f"  [DRIVE] Not enough space ({free_gb:.1f}GB free, need {src_gb:.1f}GB + 0.5GB buffer). Disabling Drive.")
+                    DRIVE_WORKING = False
+                    return False
+            except Exception:
+                pass  # Can't check space, just try it
 
         if src.is_dir():
             dest = Path(drive_dir) / label if label else Path(drive_dir) / src.name
@@ -89,7 +105,8 @@ def save_to_drive(src_path, drive_dir, label=""):
         print(f"  [DRIVE] Saved {src.name} -> Google Drive")
         return True
     except OSError as e:
-        if "No space left" in str(e) or "Quota exceeded" in str(e):
+        error_str = str(e)
+        if "No space left" in error_str or "Quota exceeded" in error_str or "ENOSPC" in error_str:
             print(f"  [DRIVE] DRIVE IS FULL! Disabling Drive saves for rest of session.")
             DRIVE_WORKING = False
         else:
@@ -103,19 +120,21 @@ def save_to_drive(src_path, drive_dir, label=""):
 def persist(src_path, drive_dir, github_token="", github_repo="", hf_token="", hf_repo="", label="", commit_msg="persist data"):
     """Try ALL persistence layers. Drive -> GitHub -> HF. Never stops the process."""
     saved = False
+    src = Path(src_path)
+    src_size = _get_size(src)
 
     # Layer 1: Try Drive
     if save_to_drive(src_path, drive_dir, label):
         saved = True
     else:
-        print(f"  [PERSIST] Drive failed, trying GitHub + HuggingFace fallback...")
+        print(f"  [PERSIST] Drive failed/unavailable, trying GitHub + HuggingFace fallback...")
 
-    # Layer 2: Try GitHub
+    # Layer 2: Try GitHub (only for files <95MB, or directories with small files)
     if github_token and github_repo:
         if push_to_github(github_token, github_repo, src_path, commit_msg):
             saved = True
 
-    # Layer 3: Try HuggingFace
+    # Layer 3: Try HuggingFace (no size limit - best for large data files)
     if hf_token and hf_repo:
         if push_to_hf(hf_token, hf_repo, src_path, label):
             saved = True
@@ -130,7 +149,7 @@ def persist(src_path, drive_dir, github_token="", github_repo="", hf_token="", h
 
 
 def push_to_github(github_token, github_repo, file_path, commit_msg="update"):
-    """Push a file to the GitHub checkpoint repo. Non-blocking."""
+    """Push a file to the GitHub checkpoint repo. Non-blocking. Skips files >95MB."""
     if not github_token or not github_repo:
         return False
     try:
@@ -153,15 +172,34 @@ def push_to_github(github_token, github_repo, file_path, commit_msg="update"):
         if not src.exists():
             return False
 
-        # For large directories, only copy small files (skip huge .pt files for data)
         if src.is_dir():
-            shutil.copytree(str(src), str(github_local / src.name), dirs_exist_ok=True)
-        else:
-            # Skip files larger than 500MB for GitHub (git push limit)
-            if src.stat().st_size > 500 * 1024 * 1024:
-                print(f"  [GITHUB] Skipping {src.name} (too large for GitHub: {src.stat().st_size/1e9:.1f}GB)")
+            # For directories, copy only files under 95MB (skip huge .pt and data files)
+            small_count = 0
+            large_count = 0
+            for f in src.rglob('*'):
+                if f.is_file():
+                    if f.stat().st_size <= GITHUB_FILE_SIZE_LIMIT:
+                        rel = f.relative_to(src)
+                        dest = github_local / "data" / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(f), str(dest))
+                        small_count += 1
+                    else:
+                        large_count += 1
+            if large_count > 0:
+                print(f"  [GITHUB] Skipped {large_count} large files (>{GITHUB_FILE_SIZE_LIMIT/1e6:.0f}MB). Use HuggingFace for large files.")
+            if small_count == 0:
+                print(f"  [GITHUB] No small files to push for {src.name}. All files too large for GitHub.")
                 return False
-            shutil.copy2(str(src), str(github_local / src.name))
+        else:
+            # Single file - check size
+            if src.stat().st_size > GITHUB_FILE_SIZE_LIMIT:
+                size_mb = src.stat().st_size / 1e6
+                print(f"  [GITHUB] Skipping {src.name} (too large: {size_mb:.0f}MB > 95MB limit). Use HuggingFace for large files.")
+                return False
+            dest = github_local / "data" / src.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dest))
 
         # Git push
         subprocess.run(["git", "config", "user.email", "zarx-1b@training.bot"],
@@ -169,8 +207,14 @@ def push_to_github(github_token, github_repo, file_path, commit_msg="update"):
         subprocess.run(["git", "config", "user.name", "ZARX-1B Bot"],
                       cwd=str(github_local), capture_output=True)
         subprocess.run(["git", "add", "-A"], cwd=str(github_local), capture_output=True)
-        subprocess.run(["git", "commit", "-m", commit_msg],
+        commit_result = subprocess.run(["git", "commit", "-m", commit_msg],
                       cwd=str(github_local), capture_output=True)
+
+        # Only push if there's something new
+        stdout = commit_result.stdout.decode() if isinstance(commit_result.stdout, bytes) else commit_result.stdout
+        if "nothing to commit" in stdout:
+            return True  # Already up to date
+
         result = subprocess.run(["git", "push", "origin", "main"],
                               cwd=str(github_local), capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
@@ -186,32 +230,43 @@ def push_to_github(github_token, github_repo, file_path, commit_msg="update"):
 
 
 def push_to_hf(hf_token, hf_repo, file_path, path_in_repo=""):
-    """Push a file to HuggingFace Hub. Non-blocking."""
+    """Push a file to HuggingFace Hub. Non-blocking. No size limit."""
     try:
         from huggingface_hub import HfApi
         src = Path(file_path)
         if not src.exists():
             return False
+        api = HfApi(token=hf_token)
+
+        # Ensure repo exists
+        try:
+            api.repo_info(repo_id=hf_repo, repo_type="model")
+        except Exception:
+            try:
+                api.create_repo(repo_id=hf_repo, repo_type="model", private=True)
+            except Exception:
+                pass
+
         if src.is_dir():
             # Upload directory
-            api = HfApi(token=hf_token)
             api.upload_folder(
                 folder_path=str(src),
                 repo_id=hf_repo,
                 repo_type="model",
                 path_in_repo=path_in_repo if path_in_repo else src.name,
             )
-            print(f"  [HF] Pushed {src.name} to {hf_repo}")
+            print(f"  [HF] Pushed {src.name}/ to {hf_repo}")
             return True
         else:
-            api = HfApi(token=hf_token)
+            hf_path = f"data/{path_in_repo}/{src.name}" if path_in_repo else src.name
             api.upload_file(
                 path_or_fileobj=str(src),
-                path_in_repo=path_in_repo if path_in_repo else src.name,
+                path_in_repo=hf_path,
                 repo_id=hf_repo,
                 repo_type="model",
             )
-            print(f"  [HF] Pushed {src.name} to {hf_repo}")
+            size_mb = src.stat().st_size / 1e6
+            print(f"  [HF] Pushed {src.name} ({size_mb:.1f}MB) to {hf_repo}")
             return True
     except Exception as e:
         print(f"  [HF] Warning: Push failed: {e}")
@@ -236,6 +291,44 @@ def restore_from_drive(drive_path, dest_path, label=""):
     except Exception as e:
         print(f"  [DRIVE] Warning: Could not restore from Drive: {e}")
         return False
+
+
+def restore_from_hf(hf_token, hf_repo, dest_path, label=""):
+    """Restore a file or directory from HuggingFace Hub if it exists."""
+    try:
+        from huggingface_hub import HfApi, snapshot_download
+        api = HfApi(token=hf_token)
+        # Check if repo has the data
+        try:
+            files = api.list_repo_files(repo_id=hf_repo, repo_type="model")
+            data_files = [f for f in files if label in f] if label else files
+            if not data_files:
+                return False
+        except Exception:
+            return False
+
+        local_dir = snapshot_download(
+            repo_id=hf_repo,
+            allow_patterns=[f"{label}/*"] if label else None,
+            repo_type="model",
+            token=hf_token,
+            local_dir="/tmp/hf_restore",
+        )
+        restore_src = Path("/tmp/hf_restore")
+        if label:
+            restore_src = restore_src / label
+        dest = Path(dest_path)
+        if restore_src.exists():
+            if restore_src.is_dir():
+                shutil.copytree(str(restore_src), str(dest), dirs_exist_ok=True)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(restore_src), str(dest))
+            print(f"  [HF] Restored {label} from HuggingFace Hub")
+            return True
+    except Exception as e:
+        print(f"  [HF] Warning: Could not restore from HF: {e}")
+    return False
 
 
 def main():
@@ -275,7 +368,7 @@ def main():
             print(f"  Skipping Flash Attention 2 (not supported on {gpu_name})")
             print(f"  PyTorch SDPA will auto-use the best available attention backend")
 
-    # ========== STEP 2: Detect Google Drive ==========
+    # ========== STEP 2: Detect Google Drive + Check Space ==========
     step(2, "Detect Google Drive + Check Space")
 
     DRIVE_DIR = Path("/content/drive/MyDrive/ZARX-1B")
@@ -283,18 +376,23 @@ def main():
         try:
             stat = shutil.disk_usage(str(DRIVE_DIR))
             free_gb = stat.free / 1e9
+            total_gb = stat.total / 1e9
+            used_gb = stat.used / 1e9
             print(f"  Google Drive detected!")
-            print(f"  Free space: {free_gb:.1f} GB")
+            print(f"  Total: {total_gb:.1f} GB | Used: {used_gb:.1f} GB | Free: {free_gb:.1f} GB")
             if free_gb < 5:
-                print(f"  WARNING: Only {free_gb:.1f}GB free on Drive. Data files may not fit.")
-                print(f"  Will fall back to GitHub + HuggingFace for persistence.")
+                print(f"  WARNING: Only {free_gb:.1f}GB free on Drive!")
+                print(f"  Drive saves may fail. Will fall back to GitHub + HuggingFace automatically.")
+                if free_gb < 1:
+                    print(f"  Drive is nearly full (<1GB). Disabling Drive saves from the start.")
+                    DRIVE_WORKING = False
             DRIVE_AVAILABLE = True
         except Exception:
             DRIVE_AVAILABLE = True
     else:
         DRIVE_DIR = Path("/content/zarx-persist")
         DRIVE_AVAILABLE = False
-        print(f"  WARNING: Google Drive not found.")
+        print(f"  Google Drive not found.")
         print(f"  Using fallback persist dir: {DRIVE_DIR}")
 
     # Create directories (may fail on full Drive, that's OK)
@@ -302,10 +400,12 @@ def main():
         for d in [DRIVE_DIR, DRIVE_DIR / "data" / "raw" / "prox-code", DRIVE_DIR / "data" / "raw" / "arc",
                   DRIVE_DIR / "data" / "processed", DRIVE_DIR / "checkpoints", DRIVE_DIR / "tokenizer", DRIVE_DIR / "configs"]:
             d.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        print(f"  [DRIVE] Could not create directories - Drive may be full. Using GitHub fallback.")
+    except OSError as e:
+        print(f"  [DRIVE] Could not create directories - Drive may be full ({e}). Using GitHub+HF fallback.")
+        DRIVE_WORKING = False
 
-    print(f"  Persistence strategy: Drive (try) -> GitHub (fallback) -> HF (fallback)")
+    drive_status = "ACTIVE" if DRIVE_WORKING else "DISABLED (will use GitHub+HF)"
+    print(f"  Persistence strategy: Drive ({drive_status}) -> GitHub (<95MB) -> HF (no limit)")
     print(f"  THE PROCESS WILL NEVER STOP due to storage issues.")
 
     # ========== STEP 3: Login ==========
@@ -364,10 +464,19 @@ def main():
         step(6, "Download ProX Code Data")
 
         drive_prox = DRIVE_DIR / "data" / "raw" / "prox-code"
+        local_prox = DATA_DIR / "raw" / "prox-code"
+
+        # Try restoring from Drive first, then HF
+        restored = False
         if drive_prox.exists() and any(drive_prox.glob("*.jsonl")):
             print(f"  Found existing ProX data on Drive! Restoring...")
-            restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"), "prox-code")
-        else:
+            restored = restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"), "prox-code")
+        
+        if not restored and args.hf_token:
+            print(f"  Trying to restore from HuggingFace...")
+            restored = restore_from_hf(args.hf_token, args.hf_repo, str(local_prox), "data/prox-code")
+
+        if not restored:
             run(
                 f"cd {BASE_DIR} && python scripts/download_data.py "
                 f"--download_prox_code "
@@ -377,7 +486,7 @@ def main():
             )
             # PERSIST: Drive -> GitHub -> HF
             print(f"\n  [PERSIST] Saving ProX data...")
-            persist(DATA_DIR / "raw" / "prox-code", DRIVE_DIR / "data" / "raw",
+            persist(local_prox, DRIVE_DIR / "data" / "raw",
                    github_token=args.github_token, github_repo=args.github_repo,
                    hf_token=args.hf_token, hf_repo=args.hf_repo,
                    label="prox-code", commit_msg="add prox-code data")
@@ -390,10 +499,14 @@ def main():
         step(7, "Download ARC-AGI Data")
 
         drive_arc = DRIVE_DIR / "data" / "raw" / "arc"
+        local_arc = DATA_DIR / "raw" / "arc"
+
+        restored = False
         if drive_arc.exists() and any(drive_arc.glob("**/*.json")):
             print(f"  Found existing ARC data on Drive! Restoring...")
-            restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"), "arc")
-        else:
+            restored = restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"), "arc")
+
+        if not restored:
             run(
                 f"cd {BASE_DIR} && python scripts/download_data.py "
                 f"--download_arc "
@@ -401,7 +514,7 @@ def main():
                 "Download ARC-AGI-1, ARC-AGI-2, and ReARC"
             )
             print(f"\n  [PERSIST] Saving ARC data...")
-            persist(DATA_DIR / "raw" / "arc", DRIVE_DIR / "data" / "raw",
+            persist(local_arc, DRIVE_DIR / "data" / "raw",
                    github_token=args.github_token, github_repo=args.github_repo,
                    hf_token=args.hf_token, hf_repo=args.hf_repo,
                    label="arc", commit_msg="add arc data")
@@ -418,7 +531,10 @@ def main():
         if drive_aug.exists():
             print(f"  Found existing augmented ARC on Drive! Restoring...")
             local_aug.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(drive_aug), str(local_aug))
+            try:
+                shutil.copy2(str(drive_aug), str(local_aug))
+            except Exception as e:
+                print(f"  [DRIVE] Could not restore: {e}")
         elif local_aug.exists():
             print(f"  Augmented ARC already exists locally.")
         elif arc1_path.exists() and arc2_path.exists():
@@ -449,10 +565,19 @@ def main():
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     drive_processed = DRIVE_DIR / "data" / "processed"
+    restored_processed = False
+
+    # Try Drive first
     if drive_processed.exists() and any(drive_processed.glob("*.jsonl")):
         print(f"  Found processed data on Drive! Restoring...")
-        restore_from_drive(str(drive_processed), str(PROCESSED_DIR))
-    else:
+        restored_processed = restore_from_drive(str(drive_processed), str(PROCESSED_DIR))
+
+    # Try HF if Drive failed
+    if not restored_processed and args.hf_token:
+        print(f"  Trying to restore processed data from HuggingFace...")
+        restored_processed = restore_from_hf(args.hf_token, args.hf_repo, str(PROCESSED_DIR), "data/processed")
+
+    if not restored_processed:
         prox_dir = DATA_DIR / "raw" / "prox-code"
         if not prox_dir.exists():
             prox_dir = DATA_DIR / "raw" / "prox"
@@ -509,10 +634,20 @@ def main():
         drive_tokenizer = DRIVE_DIR / "tokenizer" / "tokenizer.json"
         local_tokenizer = BASE_DIR / "configs" / "tokenizer.json"
 
+        # Try restoring from Drive
         if drive_tokenizer.exists():
             print(f"  Found trained tokenizer on Drive! Restoring...")
-            shutil.copy2(str(drive_tokenizer), str(local_tokenizer))
-        else:
+            try:
+                shutil.copy2(str(drive_tokenizer), str(local_tokenizer))
+            except Exception as e:
+                print(f"  [DRIVE] Could not restore tokenizer: {e}")
+
+        # Try HF if Drive failed
+        if not local_tokenizer.exists() and args.hf_token:
+            print(f"  Trying to restore tokenizer from HuggingFace...")
+            restore_from_hf(args.hf_token, args.hf_repo, str(local_tokenizer), "data/tokenizer")
+
+        if not local_tokenizer.exists():
             run(
                 f"cd {BASE_DIR} && python scripts/train_tokenizer.py "
                 f"--data_path {PROCESSED_DIR} "
@@ -530,7 +665,10 @@ def main():
         print("\n  Skipping tokenizer training (--skip_tokenizer)")
         drive_tokenizer = DRIVE_DIR / "tokenizer" / "tokenizer.json"
         if drive_tokenizer.exists():
-            shutil.copy2(str(drive_tokenizer), str(BASE_DIR / "configs" / "tokenizer.json"))
+            try:
+                shutil.copy2(str(drive_tokenizer), str(BASE_DIR / "configs" / "tokenizer.json"))
+            except Exception:
+                pass
 
     # ========== STEP 11: Short Test Training Run ==========
     if not args.skip_test_train:
@@ -592,7 +730,7 @@ def main():
 
     # ========== SUMMARY ==========
     elapsed = datetime.now() - start_time
-    drive_status = "AVAILABLE" if DRIVE_WORKING else "FULL/DISABLED (using GitHub+HF fallback)"
+    drive_status = "ACTIVE" if DRIVE_WORKING else "FULL/DISABLED (using GitHub+HF fallback)"
     print(f"\n{'='*60}")
     print(f"  ZARX-1B Day 1 Setup Complete!")
     print(f"  Time: {elapsed}")
@@ -607,8 +745,8 @@ def main():
 
   PERSISTENCE STATUS:
     Drive: {drive_status}
-    GitHub: {args.github_repo if args.github_token else 'not configured'}
-    HuggingFace: {args.hf_repo if args.hf_token else 'not configured'}
+    GitHub: {args.github_repo if args.github_token else 'not configured'} (files <95MB)
+    HuggingFace: {args.hf_repo if args.hf_token else 'not configured'} (no size limit)
     Local: /content/ (safe within this session)
 
   THE PROCESS NEVER STOPS - if one storage fails, others take over.
