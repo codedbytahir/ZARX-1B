@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 """
-ZARX-1B: Day 1 Setup Script for Google Colab
+ZARX-1B: Day 1 Setup Script — Works on BOTH Google Colab AND Kaggle
 
-*** IMPORTANT: You MUST mount Google Drive in a notebook cell BEFORE running this script! ***
+Auto-detects platform and adjusts paths:
+  - Google Colab: /content/ with Google Drive
+  - Kaggle:       /kaggle/working/ (no Drive, uses GitHub + HF)
 
-Run these cells first in your Colab notebook:
-
-  Cell 1:
-    from google.colab import drive
-    drive.mount('/content/drive')
-
-  Cell 2:
-    !git clone https://github.com/codedbytahir/ZARX-1B.git
-    %cd ZARX-1B
-    !python scripts/setup_colab_day1.py --hf_token YOUR_HF_TOKEN --wandb_key YOUR_WANDB_KEY --github_token YOUR_GH_TOKEN
-
-Persistence Strategy (Drive is OPTIONAL - never blocks the process):
-  1. Try Google Drive first (if available + has space)
+Persistence Strategy (NEVER blocks the process):
+  1. Try Google Drive first (Colab only, if available + has space)
   2. Fall back to GitHub repo (for small files <95MB)
   3. Fall back to HuggingFace (no size limit, best for large data)
   4. Local disk always works within the session
@@ -37,6 +28,53 @@ DRIVE_WORKING = True
 
 # GitHub file size limit (GitHub rejects >100MB without LFS)
 GITHUB_FILE_SIZE_LIMIT = 95 * 1024 * 1024  # 95MB with safety margin
+
+
+def detect_platform():
+    """Auto-detect if running on Colab or Kaggle."""
+    if Path("/content").exists() and Path("/content/drive").parent.exists():
+        # Check if Drive is mounted
+        if Path("/content/drive/MyDrive").exists():
+            return "colab"
+    if Path("/kaggle/working").exists():
+        return "kaggle"
+    # Fallback: check environment variables
+    if os.environ.get("COLAB_GPU"):
+        return "colab"
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        return "kaggle"
+    return "local"
+
+
+def get_paths(platform):
+    """Get platform-specific paths."""
+    if platform == "kaggle":
+        return {
+            "base_dir": Path("/kaggle/working/ZARX-1B"),
+            "data_dir": Path("/kaggle/working/data"),
+            "checkpoint_dir": Path("/kaggle/working/checkpoints"),
+            "drive_dir": None,  # No Drive on Kaggle
+            "persist_dir": Path("/kaggle/working/zarx-persist"),
+            "github_local": Path("/kaggle/working/zarx-checkpoints"),
+        }
+    elif platform == "colab":
+        return {
+            "base_dir": Path("/content/ZARX-1B"),
+            "data_dir": Path("/content/data"),
+            "checkpoint_dir": Path("/content/checkpoints"),
+            "drive_dir": Path("/content/drive/MyDrive/ZARX-1B"),
+            "persist_dir": Path("/content/zarx-persist"),
+            "github_local": Path("/content/zarx-checkpoints"),
+        }
+    else:  # local
+        return {
+            "base_dir": Path("./ZARX-1B"),
+            "data_dir": Path("./data"),
+            "checkpoint_dir": Path("./checkpoints"),
+            "drive_dir": None,
+            "persist_dir": Path("./zarx-persist"),
+            "github_local": Path("./zarx-checkpoints"),
+        }
 
 
 def run(cmd, desc="", check=True):
@@ -72,6 +110,9 @@ def _get_size(path):
 def save_to_drive(src_path, drive_dir, label=""):
     """Save to Drive. NEVER raises - always returns True/False. Non-blocking."""
     global DRIVE_WORKING
+    if not DRIVE_WORKING or not drive_dir:
+        print(f"  [DRIVE] Skipped (not available on this platform)")
+        return False
     if not DRIVE_WORKING:
         print(f"  [DRIVE] Skipped (Drive previously failed)")
         return False
@@ -117,21 +158,22 @@ def save_to_drive(src_path, drive_dir, label=""):
         return False
 
 
-def persist(src_path, drive_dir, github_token="", github_repo="", hf_token="", hf_repo="", label="", commit_msg="persist data"):
+def persist(src_path, drive_dir, github_token="", github_repo="", hf_token="", hf_repo="", label="", commit_msg="persist data", github_local_path=None):
     """Try ALL persistence layers. Drive -> GitHub -> HF. Never stops the process."""
     saved = False
     src = Path(src_path)
     src_size = _get_size(src)
 
-    # Layer 1: Try Drive
-    if save_to_drive(src_path, drive_dir, label):
-        saved = True
-    else:
-        print(f"  [PERSIST] Drive failed/unavailable, trying GitHub + HuggingFace fallback...")
+    # Layer 1: Try Drive (Colab only)
+    if drive_dir:
+        if save_to_drive(src_path, drive_dir, label):
+            saved = True
+        else:
+            print(f"  [PERSIST] Drive failed/unavailable, trying GitHub + HuggingFace fallback...")
 
     # Layer 2: Try GitHub (only for files <95MB, or directories with small files)
     if github_token and github_repo:
-        if push_to_github(github_token, github_repo, src_path, commit_msg):
+        if push_to_github(github_token, github_repo, src_path, commit_msg, github_local_path):
             saved = True
 
     # Layer 3: Try HuggingFace (no size limit - best for large data files)
@@ -140,7 +182,7 @@ def persist(src_path, drive_dir, github_token="", github_repo="", hf_token="", h
             saved = True
 
     if not saved:
-        print(f"  [PERSIST] WARNING: All persistence layers failed! Data is only on local disk (/content/).")
+        print(f"  [PERSIST] WARNING: All persistence layers failed! Data is only on local disk.")
         print(f"  [PERSIST] Process continues - local data is safe within this session.")
     else:
         print(f"  [PERSIST] Data persisted successfully.")
@@ -148,12 +190,15 @@ def persist(src_path, drive_dir, github_token="", github_repo="", hf_token="", h
     return saved
 
 
-def push_to_github(github_token, github_repo, file_path, commit_msg="update"):
+def push_to_github(github_token, github_repo, file_path, commit_msg="update", github_local_path=None):
     """Push a file to the GitHub checkpoint repo. Non-blocking. Skips files >95MB."""
     if not github_token or not github_repo:
         return False
     try:
-        github_local = Path("/content/zarx-checkpoints")
+        if github_local_path:
+            github_local = Path(github_local_path)
+        else:
+            github_local = Path("/content/zarx-checkpoints")
         auth_url = f"https://{github_token}@github.com/{github_repo}.git"
 
         if not github_local.exists():
@@ -276,6 +321,8 @@ def push_to_hf(hf_token, hf_repo, file_path, path_in_repo=""):
 def restore_from_drive(drive_path, dest_path, label=""):
     """Restore a file or directory from Google Drive if it exists."""
     global DRIVE_WORKING
+    if not drive_path:
+        return False
     try:
         src = Path(drive_path) / label if label else Path(drive_path)
         if not src.exists():
@@ -332,7 +379,7 @@ def restore_from_hf(hf_token, hf_repo, dest_path, label=""):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ZARX-1B Day 1 Setup")
+    parser = argparse.ArgumentParser(description="ZARX-1B Day 1 Setup (Colab + Kaggle)")
     parser.add_argument("--hf_token", type=str, default="", help="HuggingFace API token")
     parser.add_argument("--wandb_key", type=str, default="", help="Weights & Biases API key")
     parser.add_argument("--hf_repo", type=str, default="Chvigo/zarx-checks", help="HuggingFace checkpoint repo ID")
@@ -344,11 +391,30 @@ def main():
     parser.add_argument("--skip_test_train", action="store_true", help="Skip test training run")
     args = parser.parse_args()
 
-    BASE_DIR = Path("/content/ZARX-1B")
-    DATA_DIR = Path("/content/data")
+    # ========== AUTO-DETECT PLATFORM ==========
+    platform = detect_platform()
+    paths = get_paths(platform)
+    
+    BASE_DIR = paths["base_dir"]
+    DATA_DIR = paths["data_dir"]
     PROCESSED_DIR = DATA_DIR / "processed"
+    DRIVE_DIR = paths["drive_dir"]
+    PERSIST_DIR = paths["persist_dir"]
+    GITHUB_LOCAL = paths["github_local"]
+    CHECKPOINT_DIR = paths["checkpoint_dir"]
+
+    global DRIVE_WORKING
+    if not DRIVE_DIR:
+        DRIVE_WORKING = False
 
     start_time = datetime.now()
+
+    print(f"\n{'='*60}")
+    print(f"  ZARX-1B Setup — Platform: {platform.upper()}")
+    print(f"  Base: {BASE_DIR}")
+    print(f"  Data: {DATA_DIR}")
+    print(f"  Drive: {'Yes' if DRIVE_DIR else 'No (using GitHub+HF)'}")
+    print(f"{'='*60}")
 
     # ========== STEP 1: Environment ==========
     step(1, "Install Dependencies")
@@ -368,11 +434,10 @@ def main():
             print(f"  Skipping Flash Attention 2 (not supported on {gpu_name})")
             print(f"  PyTorch SDPA will auto-use the best available attention backend")
 
-    # ========== STEP 2: Detect Google Drive + Check Space ==========
-    step(2, "Detect Google Drive + Check Space")
+    # ========== STEP 2: Detect Storage ==========
+    step(2, "Detect Storage + Check Space")
 
-    DRIVE_DIR = Path("/content/drive/MyDrive/ZARX-1B")
-    if DRIVE_DIR.exists():
+    if DRIVE_DIR and DRIVE_DIR.exists():
         try:
             stat = shutil.disk_usage(str(DRIVE_DIR))
             free_gb = stat.free / 1e9
@@ -386,26 +451,31 @@ def main():
                 if free_gb < 1:
                     print(f"  Drive is nearly full (<1GB). Disabling Drive saves from the start.")
                     DRIVE_WORKING = False
-            DRIVE_AVAILABLE = True
         except Exception:
-            DRIVE_AVAILABLE = True
+            pass
     else:
-        DRIVE_DIR = Path("/content/zarx-persist")
-        DRIVE_AVAILABLE = False
-        print(f"  Google Drive not found.")
-        print(f"  Using fallback persist dir: {DRIVE_DIR}")
-
-    # Create directories (may fail on full Drive, that's OK)
-    try:
-        for d in [DRIVE_DIR, DRIVE_DIR / "data" / "raw" / "prox-code", DRIVE_DIR / "data" / "raw" / "arc",
-                  DRIVE_DIR / "data" / "processed", DRIVE_DIR / "checkpoints", DRIVE_DIR / "tokenizer", DRIVE_DIR / "configs"]:
-            d.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        print(f"  [DRIVE] Could not create directories - Drive may be full ({e}). Using GitHub+HF fallback.")
+        if platform == "kaggle":
+            print(f"  Running on Kaggle — no Google Drive available.")
+            print(f"  Using GitHub + HuggingFace for persistence.")
+        else:
+            print(f"  Google Drive not found. Using fallback persist dir: {PERSIST_DIR}")
         DRIVE_WORKING = False
 
-    drive_status = "ACTIVE" if DRIVE_WORKING else "DISABLED (will use GitHub+HF)"
-    print(f"  Persistence strategy: Drive ({drive_status}) -> GitHub (<95MB) -> HF (no limit)")
+    # Create directories
+    dirs_to_create = [DATA_DIR, DATA_DIR / "raw" / "prox-code", DATA_DIR / "raw" / "arc",
+                      PROCESSED_DIR, CHECKPOINT_DIR]
+    if DRIVE_DIR and DRIVE_WORKING:
+        dirs_to_create += [DRIVE_DIR, DRIVE_DIR / "data" / "raw" / "prox-code", DRIVE_DIR / "data" / "raw" / "arc",
+                          DRIVE_DIR / "data" / "processed", DRIVE_DIR / "checkpoints", DRIVE_DIR / "tokenizer", DRIVE_DIR / "configs"]
+    
+    for d in dirs_to_create:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    drive_status = "ACTIVE" if DRIVE_WORKING else "DISABLED (using GitHub+HF)"
+    print(f"  Persistence: Drive ({drive_status}) -> GitHub (<95MB) -> HF (no limit)")
     print(f"  THE PROCESS WILL NEVER STOP due to storage issues.")
 
     # ========== STEP 3: Login ==========
@@ -424,7 +494,7 @@ def main():
 
     # Init GitHub checkpoint repo
     if args.github_token:
-        push_to_github(args.github_token, args.github_repo, "", "init")
+        push_to_github(args.github_token, args.github_repo, "", "init", GITHUB_LOCAL)
 
     # ========== STEP 4: Verify GPU ==========
     step(4, "Verify GPU Environment")
@@ -463,18 +533,22 @@ def main():
     if not args.skip_download:
         step(6, "Download ProX Code Data")
 
-        drive_prox = DRIVE_DIR / "data" / "raw" / "prox-code"
+        drive_prox = DRIVE_DIR / "data" / "raw" / "prox-code" if DRIVE_DIR else None
         local_prox = DATA_DIR / "raw" / "prox-code"
 
         # Try restoring from Drive first, then HF
         restored = False
-        if drive_prox.exists() and any(drive_prox.glob("*.jsonl")):
+        if drive_prox and drive_prox.exists() and any(drive_prox.glob("*.jsonl")):
             print(f"  Found existing ProX data on Drive! Restoring...")
             restored = restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"), "prox-code")
         
         if not restored and args.hf_token:
             print(f"  Trying to restore from HuggingFace...")
             restored = restore_from_hf(args.hf_token, args.hf_repo, str(local_prox), "data/prox-code")
+
+        if not restored and local_prox.exists() and any(local_prox.glob("*.jsonl")):
+            print(f"  Found existing ProX data locally!")
+            restored = True
 
         if not restored:
             run(
@@ -486,25 +560,35 @@ def main():
             )
             # PERSIST: Drive -> GitHub -> HF
             print(f"\n  [PERSIST] Saving ProX data...")
-            persist(local_prox, DRIVE_DIR / "data" / "raw",
+            persist(local_prox, DRIVE_DIR / "data" / "raw" if DRIVE_DIR else None,
                    github_token=args.github_token, github_repo=args.github_repo,
                    hf_token=args.hf_token, hf_repo=args.hf_repo,
-                   label="prox-code", commit_msg="add prox-code data")
+                   label="prox-code", commit_msg="add prox-code data",
+                   github_local_path=GITHUB_LOCAL)
     else:
         print("\n  Skipping data download (--skip_download)")
-        restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"))
+        if DRIVE_DIR:
+            restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"))
 
     # ========== STEP 7: Download ARC Data ==========
     if not args.skip_download:
         step(7, "Download ARC-AGI Data")
 
-        drive_arc = DRIVE_DIR / "data" / "raw" / "arc"
+        drive_arc = DRIVE_DIR / "data" / "raw" / "arc" if DRIVE_DIR else None
         local_arc = DATA_DIR / "raw" / "arc"
 
         restored = False
-        if drive_arc.exists() and any(drive_arc.glob("**/*.json")):
+        if drive_arc and drive_arc.exists() and any(drive_arc.glob("**/*.json")):
             print(f"  Found existing ARC data on Drive! Restoring...")
             restored = restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"), "arc")
+
+        if not restored and args.hf_token:
+            print(f"  Trying to restore ARC from HuggingFace...")
+            restored = restore_from_hf(args.hf_token, args.hf_repo, str(local_arc), "data/arc")
+
+        if not restored and local_arc.exists() and any(local_arc.glob("**/*.json")):
+            print(f"  Found existing ARC data locally!")
+            restored = True
 
         if not restored:
             run(
@@ -514,10 +598,11 @@ def main():
                 "Download ARC-AGI-1, ARC-AGI-2, and ReARC"
             )
             print(f"\n  [PERSIST] Saving ARC data...")
-            persist(local_arc, DRIVE_DIR / "data" / "raw",
+            persist(local_arc, DRIVE_DIR / "data" / "raw" if DRIVE_DIR else None,
                    github_token=args.github_token, github_repo=args.github_repo,
                    hf_token=args.hf_token, hf_repo=args.hf_repo,
-                   label="arc", commit_msg="add arc data")
+                   label="arc", commit_msg="add arc data",
+                   github_local_path=GITHUB_LOCAL)
 
     # ========== STEP 8: Generate ARC Augmentations ==========
     if not args.skip_arc_augment:
@@ -525,10 +610,10 @@ def main():
 
         arc1_path = DATA_DIR / "raw" / "arc" / "arc-agi-1" / "data" / "training"
         arc2_path = DATA_DIR / "raw" / "arc" / "arc-agi-2" / "data" / "training"
-        drive_aug = DRIVE_DIR / "data" / "raw" / "arc" / "augmented_arc.jsonl"
+        drive_aug = DRIVE_DIR / "data" / "raw" / "arc" / "augmented_arc.jsonl" if DRIVE_DIR else None
         local_aug = DATA_DIR / "raw" / "arc" / "augmented_arc.jsonl"
 
-        if drive_aug.exists():
+        if drive_aug and drive_aug.exists():
             print(f"  Found existing augmented ARC on Drive! Restoring...")
             local_aug.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -548,10 +633,11 @@ def main():
                 "Generate augmented ARC tasks (400K+ tasks)"
             )
             print(f"\n  [PERSIST] Saving augmented ARC data...")
-            persist(local_aug, DRIVE_DIR / "data" / "raw" / "arc",
+            persist(local_aug, DRIVE_DIR / "data" / "raw" / "arc" if DRIVE_DIR else None,
                    github_token=args.github_token, github_repo=args.github_repo,
                    hf_token=args.hf_token, hf_repo=args.hf_repo,
-                   commit_msg="add augmented arc data")
+                   commit_msg="add augmented arc data",
+                   github_local_path=GITHUB_LOCAL)
         else:
             print(f"  ARC paths not found:")
             print(f"    ARC-AGI-1: {arc1_path} (exists: {arc1_path.exists()})")
@@ -564,11 +650,11 @@ def main():
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    drive_processed = DRIVE_DIR / "data" / "processed"
+    drive_processed = DRIVE_DIR / "data" / "processed" if DRIVE_DIR else None
     restored_processed = False
 
     # Try Drive first
-    if drive_processed.exists() and any(drive_processed.glob("*.jsonl")):
+    if drive_processed and drive_processed.exists() and any(drive_processed.glob("*.jsonl")):
         print(f"  Found processed data on Drive! Restoring...")
         restored_processed = restore_from_drive(str(drive_processed), str(PROCESSED_DIR))
 
@@ -576,6 +662,11 @@ def main():
     if not restored_processed and args.hf_token:
         print(f"  Trying to restore processed data from HuggingFace...")
         restored_processed = restore_from_hf(args.hf_token, args.hf_repo, str(PROCESSED_DIR), "data/processed")
+
+    # Check if already exists locally
+    if not restored_processed and PROCESSED_DIR.exists() and any(PROCESSED_DIR.glob("*.jsonl")):
+        print(f"  Found processed data locally!")
+        restored_processed = True
 
     if not restored_processed:
         prox_dir = DATA_DIR / "raw" / "prox-code"
@@ -585,6 +676,9 @@ def main():
         if prox_dir.exists():
             for shard_file in sorted(prox_dir.glob("*.jsonl"))[:3]:
                 output_file = PROCESSED_DIR / shard_file.name.replace('shard', 'processed')
+                if output_file.exists():
+                    print(f"  Skipping {shard_file.name} (already processed)")
+                    continue
                 run(
                     f"cd {BASE_DIR} && python src/data_pipeline.py --mode process "
                     f"--input_file {shard_file} "
@@ -593,49 +687,54 @@ def main():
                     f"Process {shard_file.name}"
                 )
                 print(f"\n  [PERSIST] Saving processed shard...")
-                persist(output_file, DRIVE_DIR / "data" / "processed",
+                persist(output_file, DRIVE_DIR / "data" / "processed" if DRIVE_DIR else None,
                        github_token=args.github_token, github_repo=args.github_repo,
                        hf_token=args.hf_token, hf_repo=args.hf_repo,
-                       commit_msg=f"add processed {shard_file.name}")
+                       commit_msg=f"add processed {shard_file.name}",
+                       github_local_path=GITHUB_LOCAL)
 
         arc_file = DATA_DIR / "raw" / "arc" / "augmented_arc.jsonl"
         if arc_file.exists():
             arc_output = PROCESSED_DIR / 'arc_processed.jsonl'
-            run(
-                f"cd {BASE_DIR} && python src/data_pipeline.py --mode process "
-                f"--input_file {arc_file} "
-                f"--output_file {arc_output} "
-                f"--source arc",
-                "Process ARC augmented data"
-            )
-            print(f"\n  [PERSIST] Saving processed ARC data...")
-            persist(arc_output, DRIVE_DIR / "data" / "processed",
-                   github_token=args.github_token, github_repo=args.github_repo,
-                   hf_token=args.hf_token, hf_repo=args.hf_repo,
-                   commit_msg="add processed arc data")
+            if not arc_output.exists():
+                run(
+                    f"cd {BASE_DIR} && python src/data_pipeline.py --mode process "
+                    f"--input_file {arc_file} "
+                    f"--output_file {arc_output} "
+                    f"--source arc",
+                    "Process ARC augmented data"
+                )
+                print(f"\n  [PERSIST] Saving processed ARC data...")
+                persist(arc_output, DRIVE_DIR / "data" / "processed" if DRIVE_DIR else None,
+                       github_token=args.github_token, github_repo=args.github_repo,
+                       hf_token=args.hf_token, hf_repo=args.hf_repo,
+                       commit_msg="add processed arc data",
+                       github_local_path=GITHUB_LOCAL)
 
         merged_file = PROCESSED_DIR / 'zarx_pretrain.jsonl'
-        run(
-            f"cd {BASE_DIR} && python src/data_pipeline.py --mode merge "
-            f"--processed_dir {PROCESSED_DIR} "
-            f"--output_file {merged_file}",
-            "Merge all processed data"
-        )
-        print(f"\n  [PERSIST] Saving merged pretraining data...")
-        persist(PROCESSED_DIR, DRIVE_DIR / "data", "processed",
-               github_token=args.github_token, github_repo=args.github_repo,
-               hf_token=args.hf_token, hf_repo=args.hf_repo,
-               commit_msg="add merged pretrain data")
+        if not merged_file.exists():
+            run(
+                f"cd {BASE_DIR} && python src/data_pipeline.py --mode merge "
+                f"--processed_dir {PROCESSED_DIR} "
+                f"--output_file {merged_file}",
+                "Merge all processed data"
+            )
+            print(f"\n  [PERSIST] Saving merged pretraining data...")
+            persist(PROCESSED_DIR, DRIVE_DIR / "data" if DRIVE_DIR else None, "processed",
+                   github_token=args.github_token, github_repo=args.github_repo,
+                   hf_token=args.hf_token, hf_repo=args.hf_repo,
+                   commit_msg="add merged pretrain data",
+                   github_local_path=GITHUB_LOCAL)
 
     # ========== STEP 10: Train Tokenizer ==========
     if not args.skip_tokenizer:
         step(10, "Train Custom BPE Tokenizer")
 
-        drive_tokenizer = DRIVE_DIR / "tokenizer" / "tokenizer.json"
+        drive_tokenizer = DRIVE_DIR / "tokenizer" / "tokenizer.json" if DRIVE_DIR else None
         local_tokenizer = BASE_DIR / "configs" / "tokenizer.json"
 
         # Try restoring from Drive
-        if drive_tokenizer.exists():
+        if drive_tokenizer and drive_tokenizer.exists():
             print(f"  Found trained tokenizer on Drive! Restoring...")
             try:
                 shutil.copy2(str(drive_tokenizer), str(local_tokenizer))
@@ -657,18 +756,20 @@ def main():
                 "Train 32K BPE tokenizer on code + ARC corpus"
             )
             print(f"\n  [PERSIST] Saving tokenizer...")
-            persist(local_tokenizer, DRIVE_DIR / "tokenizer",
+            persist(local_tokenizer, DRIVE_DIR / "tokenizer" if DRIVE_DIR else None,
                    github_token=args.github_token, github_repo=args.github_repo,
                    hf_token=args.hf_token, hf_repo=args.hf_repo,
-                   commit_msg="add trained tokenizer")
+                   commit_msg="add trained tokenizer",
+                   github_local_path=GITHUB_LOCAL)
     else:
         print("\n  Skipping tokenizer training (--skip_tokenizer)")
-        drive_tokenizer = DRIVE_DIR / "tokenizer" / "tokenizer.json"
-        if drive_tokenizer.exists():
-            try:
-                shutil.copy2(str(drive_tokenizer), str(BASE_DIR / "configs" / "tokenizer.json"))
-            except Exception:
-                pass
+        if DRIVE_DIR:
+            drive_tokenizer = DRIVE_DIR / "tokenizer" / "tokenizer.json"
+            if drive_tokenizer.exists():
+                try:
+                    shutil.copy2(str(drive_tokenizer), str(BASE_DIR / "configs" / "tokenizer.json"))
+                except Exception:
+                    pass
 
     # ========== STEP 11: Short Test Training Run ==========
     if not args.skip_test_train:
@@ -692,8 +793,8 @@ def main():
                 f"--warmup_steps 100 "
                 f"--total_tokens 65536000 "
                 f"--use_8bit_adam "
-                f"--checkpoint_dir /content/checkpoints "
-                f"--drive_dir {DRIVE_DIR} "
+                f"--checkpoint_dir {CHECKPOINT_DIR} "
+                f"--drive_dir {DRIVE_DIR if DRIVE_DIR else PERSIST_DIR} "
                 + github_flags
                 + hf_flags
                 + f"--save_every_local 200 "
@@ -713,26 +814,29 @@ def main():
 
     # Try all layers for final sync
     if PROCESSED_DIR.exists():
-        persist(PROCESSED_DIR, DRIVE_DIR / "data", "processed",
+        persist(PROCESSED_DIR, DRIVE_DIR / "data" if DRIVE_DIR else None, "processed",
                github_token=args.github_token, github_repo=args.github_repo,
                hf_token=args.hf_token, hf_repo=args.hf_repo,
-               commit_msg="final sync - processed data")
+               commit_msg="final sync - processed data",
+               github_local_path=GITHUB_LOCAL)
     if (BASE_DIR / "configs" / "tokenizer.json").exists():
-        persist(BASE_DIR / "configs" / "tokenizer.json", DRIVE_DIR / "tokenizer",
+        persist(BASE_DIR / "configs" / "tokenizer.json", DRIVE_DIR / "tokenizer" if DRIVE_DIR else None,
                github_token=args.github_token, github_repo=args.github_repo,
                hf_token=args.hf_token, hf_repo=args.hf_repo,
-               commit_msg="final sync - tokenizer")
-    if Path("/content/checkpoints").exists():
-        persist("/content/checkpoints", DRIVE_DIR, "checkpoints",
+               commit_msg="final sync - tokenizer",
+               github_local_path=GITHUB_LOCAL)
+    if CHECKPOINT_DIR.exists():
+        persist(str(CHECKPOINT_DIR), DRIVE_DIR if DRIVE_DIR else None, "checkpoints",
                github_token=args.github_token, github_repo=args.github_repo,
                hf_token=args.hf_token, hf_repo=args.hf_repo,
-               commit_msg="final sync - checkpoints")
+               commit_msg="final sync - checkpoints",
+               github_local_path=GITHUB_LOCAL)
 
     # ========== SUMMARY ==========
     elapsed = datetime.now() - start_time
-    drive_status = "ACTIVE" if DRIVE_WORKING else "FULL/DISABLED (using GitHub+HF fallback)"
+    drive_status = "ACTIVE" if DRIVE_WORKING else "DISABLED (using GitHub+HF fallback)"
     print(f"\n{'='*60}")
-    print(f"  ZARX-1B Day 1 Setup Complete!")
+    print(f"  ZARX-1B Day 1 Setup Complete! ({platform.upper()})")
     print(f"  Time: {elapsed}")
     print(f"{'='*60}")
     print(f"""
@@ -744,10 +848,11 @@ def main():
     Test training run completed
 
   PERSISTENCE STATUS:
+    Platform: {platform.upper()}
     Drive: {drive_status}
     GitHub: {args.github_repo if args.github_token else 'not configured'} (files <95MB)
     HuggingFace: {args.hf_repo if args.hf_token else 'not configured'} (no size limit)
-    Local: /content/ (safe within this session)
+    Local: {BASE_DIR.parent} (safe within this session)
 
   THE PROCESS NEVER STOPS - if one storage fails, others take over.
     """)
