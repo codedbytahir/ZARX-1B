@@ -135,16 +135,18 @@ class Attention(nn.Module):
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Expand KV heads for GQA
+        # Apply RoPE (before KV expansion to save memory)
+        cos, sin = self.rotary_emb(seq_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Expand KV heads for GQA (after RoPE to avoid computing RoPE on duplicated tensors)
         if self.num_kv_groups > 1:
             k = k.repeat_interleave(self.num_kv_groups, dim=1)
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
-        # Apply RoPE
-        cos, sin = self.rotary_emb(seq_len)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
         # Flash Attention via PyTorch SDPA
+        # Use is_causal=True when no custom mask — SDPA handles it efficiently
+        # This avoids creating a huge seq_len x seq_len attention matrix
         output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attention_mask,
@@ -242,16 +244,24 @@ class ZARXModel(nn.Module):
         # Embedding
         hidden_states = self.embed_tokens(input_ids)
 
-        # Causal mask
+        # Causal mask — ONLY build explicit mask for padding
+        # When there's no padding mask, we skip the huge (seq_len x seq_len) matrix
+        # and let SDPA handle causality via is_causal=True (much more memory efficient)
         if attention_mask is not None:
-            causal_mask = torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=input_ids.device),
-                diagonal=1,
-            )
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask[:, None, None, :]
-            causal_mask = causal_mask + attention_mask
+            # Check if there's actual padding (not all 1s)
+            has_padding = (attention_mask == 0).any()
+            if has_padding:
+                causal_mask = torch.triu(
+                    torch.full((seq_len, seq_len), float("-inf"), device=input_ids.device),
+                    diagonal=1,
+                )
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+                if attention_mask.dim() == 2:
+                    attention_mask = attention_mask[:, None, None, :]
+                causal_mask = causal_mask + attention_mask
+            else:
+                # All tokens are valid — no need for explicit mask
+                causal_mask = None
         else:
             causal_mask = None
 
