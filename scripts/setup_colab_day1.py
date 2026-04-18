@@ -77,13 +77,25 @@ def main():
     run("pip install -q huggingface_hub", "HuggingFace Hub")
     run("pip install -q datasets tokenizers accelerate", "HuggingFace ecosystem")
     run("pip install -q datasketch", "MinHash dedup")
-    run("pip install -q flash-attn --no-build-isolation", "Flash Attention 2 (may take 3-5 min)", check=False)
+    # Flash Attention 2 requires Ampere+ GPU (A100, RTX 3090, etc.)
+    # T4 (Turing) doesn't support it — PyTorch SDPA auto-fallback works fine
+    import torch
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name()
+        if "A100" in gpu_name or "A10" in gpu_name or "RTX 30" in gpu_name or "RTX 40" in gpu_name or "L4" in gpu_name:
+            run("pip install -q flash-attn --no-build-isolation", "Flash Attention 2 (Ampere+ GPU detected)", check=False)
+        else:
+            print(f"  Skipping Flash Attention 2 (not supported on {gpu_name})")
+            print(f"  PyTorch SDPA will auto-use the best available attention backend")
 
     # ========== STEP 2: Login ==========
     step(2, "Login to Services")
 
     if args.hf_token:
-        run(f"huggingface-cli login --token {args.hf_token}", "HuggingFace login")
+        # Try new `hf` CLI first, fall back to legacy `huggingface-cli`
+        if not run(f"hf auth login --token {args.hf_token}", "HuggingFace login (new CLI)", check=False):
+            run(f"huggingface-cli login --token {args.hf_token}", "HuggingFace login (legacy CLI)", check=False)
+            print("  Note: huggingface-cli is deprecated. Update with: pip install -U huggingface_hub")
 
     if args.wandb_key:
         run(f"wandb login {args.wandb_key}", "W&B login")
