@@ -453,7 +453,7 @@ def parse_args():
     # Checkpointing
     parser.add_argument("--checkpoint_dir", type=str, default="/content/checkpoints")
     parser.add_argument("--drive_dir", type=str, default="/content/drive/MyDrive/ZARX-1B")
-    parser.add_argument("--hf_repo_id", type=str, default=None)
+    parser.add_argument("--hf_repo_id", type=str, default="Chvigo/zarx-checks")
     parser.add_argument("--hf_token", type=str, default=None)
     parser.add_argument("--github_token", type=str, default=None, help="GitHub personal token for checkpoint pushes")
     parser.add_argument("--github_repo", type=str, default="codedbytahir/zarx-checkpoints", help="GitHub checkpoint repo")

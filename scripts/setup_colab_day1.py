@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
 ZARX-1B: Day 1 Setup Script for Google Colab
-Run this ONCE on a fresh Colab session to set up everything.
 
-What this does:
+*** IMPORTANT: You MUST mount Google Drive in a notebook cell BEFORE running this script! ***
+
+Run these cells first in your Colab notebook:
+
+  Cell 1:
+    from google.colab import drive
+    drive.mount('/content/drive')
+
+  Cell 2:
+    !git clone https://github.com/codedbytahir/ZARX-1B.git
+    %cd ZARX-1B
+    !python scripts/setup_colab_day1.py --hf_token YOUR_HF_TOKEN --wandb_key YOUR_WANDB_KEY --github_token YOUR_GH_TOKEN
+
+What this script does:
 1. Installs all dependencies
-2. Mounts Google Drive (PERSISTENCE LAYER)
+2. Detects Google Drive (must be pre-mounted!)
 3. Logins to HuggingFace & W&B
 4. Verifies GPU environment
 5. Tests model architecture
-6. Downloads ProX code data → saves to Drive
-7. Downloads ARC-AGI data → saves to Drive
-8. Generates ARC augmentations → saves to Drive
-9. Preprocesses all data → saves to Drive
-10. Trains custom BPE tokenizer → saves to Drive
-11. Short test training run (1000 steps) → checkpoints to Drive + GitHub + HF
+6. Downloads ProX code data -> saves to Drive
+7. Downloads ARC-AGI data -> saves to Drive
+8. Generates ARC augmentations -> saves to Drive
+9. Preprocesses all data -> saves to Drive
+10. Trains custom BPE tokenizer -> saves to Drive
+11. Short test training run (1000 steps) -> checkpoints to Drive + GitHub + HF
 
 EVERY step saves to Google Drive so nothing is lost on disconnect.
-
-Usage on Colab:
-  !git clone https://github.com/codedbytahir/ZARX-1B.git
-  %cd ZARX-1B
-  !python scripts/setup_colab_day1.py --hf_token YOUR_HF_TOKEN --wandb_key YOUR_WANDB_KEY --github_token YOUR_GH_TOKEN
 """
 
 import os
@@ -66,7 +73,7 @@ def save_to_drive(src_path, drive_dir, label=""):
             dest = Path(drive_dir) / label if label else Path(drive_dir) / src.name
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dest))
-        print(f"  [DRIVE] Saved {src.name} to Google Drive")
+        print(f"  [DRIVE] Saved {src.name} -> Google Drive")
         return True
     except Exception as e:
         print(f"  [DRIVE] Warning: Could not save to Drive: {e}")
@@ -93,7 +100,7 @@ def restore_from_drive(drive_path, dest_path, label=""):
 
 
 def push_to_github(github_token, github_repo, file_path, commit_msg="update"):
-    """Push a file to the GitHub checkpoint repo."""
+    """Push a file or directory to the GitHub checkpoint repo."""
     if not github_token or not github_repo:
         return False
     try:
@@ -101,16 +108,20 @@ def push_to_github(github_token, github_repo, file_path, commit_msg="update"):
         auth_url = f"https://{github_token}@github.com/{github_repo}.git"
 
         if not github_local.exists():
-            subprocess.run(["git", "clone", auth_url, str(github_local)],
-                         capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                ["git", "clone", auth_url, str(github_local)],
+                capture_output=True, text=True, timeout=60
+            )
             if not github_local.exists():
                 github_local.mkdir(parents=True, exist_ok=True)
                 subprocess.run(["git", "init"], cwd=str(github_local), capture_output=True)
                 subprocess.run(["git", "remote", "add", "origin", auth_url],
                              cwd=str(github_local), capture_output=True)
 
-        # Copy file
+        # Copy file or directory
         src = Path(file_path)
+        if not src.exists():
+            return False
         if src.is_dir():
             shutil.copytree(str(src), str(github_local / src.name), dirs_exist_ok=True)
         else:
@@ -126,17 +137,13 @@ def push_to_github(github_token, github_repo, file_path, commit_msg="update"):
                       cwd=str(github_local), capture_output=True)
         result = subprocess.run(["git", "push", "origin", "main"],
                               cwd=str(github_local), capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            print(f"  [GITHUB] Pushed {src.name} to {github_repo}")
-            return True
-        else:
-            # Try with force set-url
+        if result.returncode != 0:
             subprocess.run(["git", "remote", "set-url", "origin", auth_url],
                           cwd=str(github_local), capture_output=True)
             subprocess.run(["git", "push", "-u", "origin", "main"],
                           cwd=str(github_local), capture_output=True, text=True, timeout=120)
-            print(f"  [GITHUB] Pushed {src.name} to {github_repo}")
-            return True
+        print(f"  [GITHUB] Pushed to {github_repo}")
+        return True
     except Exception as e:
         print(f"  [GITHUB] Warning: Push failed: {e}")
         return False
@@ -146,7 +153,7 @@ def main():
     parser = argparse.ArgumentParser(description="ZARX-1B Day 1 Setup")
     parser.add_argument("--hf_token", type=str, default="", help="HuggingFace API token")
     parser.add_argument("--wandb_key", type=str, default="", help="Weights & Biases API key")
-    parser.add_argument("--hf_repo", type=str, default="", help="HuggingFace checkpoint repo ID")
+    parser.add_argument("--hf_repo", type=str, default="Chvigo/zarx-checks", help="HuggingFace checkpoint repo ID")
     parser.add_argument("--github_token", type=str, default="", help="GitHub personal token for checkpoint pushes")
     parser.add_argument("--github_repo", type=str, default="codedbytahir/zarx-checkpoints", help="GitHub checkpoint repo")
     parser.add_argument("--skip_download", action="store_true", help="Skip data download (if already done)")
@@ -181,23 +188,32 @@ def main():
             print(f"  Skipping Flash Attention 2 (not supported on {gpu_name})")
             print(f"  PyTorch SDPA will auto-use the best available attention backend")
 
-    # ========== STEP 2: Mount Google Drive (PERSISTENCE!) ==========
-    step(2, "Mount Google Drive + Create Persistence Directories")
+    # ========== STEP 2: Detect Google Drive ==========
+    step(2, "Detect Google Drive + Create Persistence Directories")
 
-    try:
-        from google.colab import drive
-        drive.mount("/content/drive")
-        DRIVE_DIR = Path("/content/drive/MyDrive/ZARX-1B")
-        DRIVE_MOUNTED = True
-    except ImportError:
+    # IMPORTANT: Drive must be mounted BEFORE running this script via:
+    #   from google.colab import drive
+    #   drive.mount('/content/drive')
+    # We do NOT call drive.mount() here because it crashes when called from a subprocess.
+
+    DRIVE_DIR = Path("/content/drive/MyDrive/ZARX-1B")
+    if DRIVE_DIR.exists():
+        print(f"  Google Drive detected and mounted!")
+        DRIVE_AVAILABLE = True
+    else:
         DRIVE_DIR = Path("/content/zarx-persist")
-        DRIVE_MOUNTED = False
-        print("  Warning: Not running in Colab. Using local persist dir.")
+        DRIVE_AVAILABLE = False
+        print(f"  WARNING: Google Drive not found at /content/drive/MyDrive/ZARX-1B")
+        print(f"  Did you forget to mount Drive? Run this in a notebook cell first:")
+        print(f"    from google.colab import drive")
+        print(f"    drive.mount('/content/drive')")
+        print(f"  Using fallback persist dir: {DRIVE_DIR}")
 
     # Create all persistence directories on Drive
     dirs_to_create = [
         DRIVE_DIR,
-        DRIVE_DIR / "data" / "raw",
+        DRIVE_DIR / "data" / "raw" / "prox-code",
+        DRIVE_DIR / "data" / "raw" / "arc",
         DRIVE_DIR / "data" / "processed",
         DRIVE_DIR / "checkpoints",
         DRIVE_DIR / "tokenizer",
@@ -206,7 +222,6 @@ def main():
     for d in dirs_to_create:
         d.mkdir(parents=True, exist_ok=True)
 
-    print(f"  Google Drive mounted: {DRIVE_MOUNTED}")
     print(f"  Persistence dir: {DRIVE_DIR}")
     print(f"  All data WILL be saved to Drive after every step.")
 
@@ -284,10 +299,16 @@ def main():
                 f"--max_prox_examples 2000000",
                 "Download ProX code-filtered data (this takes a while)"
             )
-            # SAVE TO DRIVE
+            # SAVE TO DRIVE IMMEDIATELY
+            print(f"\n  [PERSIST] Saving downloaded ProX data to Drive...")
             save_to_drive(DATA_DIR / "raw" / "prox-code", DRIVE_DIR / "data" / "raw", "prox-code")
+    else:
+        print("\n  Skipping data download (--skip_download)")
+        # Try restore from Drive anyway
+        restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"))
 
-        # ========== STEP 7: Download ARC Data ==========
+    # ========== STEP 7: Download ARC Data ==========
+    if not args.skip_download:
         step(7, "Download ARC-AGI Data")
 
         drive_arc = DRIVE_DIR / "data" / "raw" / "arc"
@@ -301,12 +322,9 @@ def main():
                 f"--output_dir {DATA_DIR}/raw",
                 "Download ARC-AGI-1, ARC-AGI-2, and ReARC"
             )
-            # SAVE TO DRIVE
+            # SAVE TO DRIVE IMMEDIATELY
+            print(f"\n  [PERSIST] Saving downloaded ARC data to Drive...")
             save_to_drive(DATA_DIR / "raw" / "arc", DRIVE_DIR / "data" / "raw", "arc")
-    else:
-        print("\n  Skipping data download (--skip_download)")
-        # Try restore from Drive anyway
-        restore_from_drive(str(DRIVE_DIR / "data" / "raw"), str(DATA_DIR / "raw"))
 
     # ========== STEP 8: Generate ARC Augmentations ==========
     if not args.skip_arc_augment:
@@ -317,22 +335,27 @@ def main():
 
         # Check if already augmented on Drive
         drive_aug = DRIVE_DIR / "data" / "raw" / "arc" / "augmented_arc.jsonl"
+        local_aug = DATA_DIR / "raw" / "arc" / "augmented_arc.jsonl"
+
         if drive_aug.exists():
             print(f"  Found existing augmented ARC on Drive! Restoring...")
-            shutil.copy2(str(drive_aug), str(DATA_DIR / "raw" / "arc" / "augmented_arc.jsonl"))
+            local_aug.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(drive_aug), str(local_aug))
+        elif local_aug.exists():
+            print(f"  Augmented ARC already exists locally.")
         elif arc1_path.exists() and arc2_path.exists():
             run(
                 f"cd {BASE_DIR} && python src/arc_augment.py "
                 f"--arc1_path {arc1_path} "
                 f"--arc2_path {arc2_path} "
                 f"--variations_per_task 500 "
-                f"--output_path {DATA_DIR}/raw/arc/augmented_arc.jsonl "
+                f"--output_path {local_aug} "
                 f"--format code_reasoning",
                 "Generate augmented ARC tasks (400K+ tasks)"
             )
-            # SAVE TO DRIVE
-            save_to_drive(DATA_DIR / "raw" / "arc" / "augmented_arc.jsonl",
-                         DRIVE_DIR / "data" / "raw" / "arc")
+            # SAVE TO DRIVE IMMEDIATELY
+            print(f"\n  [PERSIST] Saving augmented ARC data to Drive...")
+            save_to_drive(local_aug, DRIVE_DIR / "data" / "raw" / "arc")
         else:
             print(f"  ARC paths not found:")
             print(f"    ARC-AGI-1: {arc1_path} (exists: {arc1_path.exists()})")
@@ -341,7 +364,7 @@ def main():
         print("\n  Skipping ARC augmentation (--skip_arc_augment)")
 
     # ========== STEP 9: Preprocess Data ==========
-    step(9, "Preprocess Data")
+    step(9, "Preprocess Data (Dedup, Filter, Merge)")
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -351,41 +374,50 @@ def main():
         print(f"  Found processed data on Drive! Restoring...")
         restore_from_drive(str(drive_processed), str(PROCESSED_DIR))
     else:
-        # Process ProX data
+        # Process ProX data - EACH shard saved to Drive after processing
         prox_dir = DATA_DIR / "raw" / "prox-code"
         if not prox_dir.exists():
             prox_dir = DATA_DIR / "raw" / "prox"
 
         if prox_dir.exists():
             for shard_file in sorted(prox_dir.glob("*.jsonl"))[:3]:
+                output_file = PROCESSED_DIR / shard_file.name.replace('shard', 'processed')
                 run(
                     f"cd {BASE_DIR} && python src/data_pipeline.py --mode process "
                     f"--input_file {shard_file} "
-                    f"--output_file {PROCESSED_DIR / shard_file.name.replace('shard', 'processed')} "
+                    f"--output_file {output_file} "
                     f"--source prox",
                     f"Process {shard_file.name}"
                 )
+                # SAVE EACH PROCESSED SHARD TO DRIVE IMMEDIATELY
+                print(f"\n  [PERSIST] Saving processed shard to Drive...")
+                save_to_drive(output_file, DRIVE_DIR / "data" / "processed")
 
         # Process ARC data
         arc_file = DATA_DIR / "raw" / "arc" / "augmented_arc.jsonl"
         if arc_file.exists():
+            arc_output = PROCESSED_DIR / 'arc_processed.jsonl'
             run(
                 f"cd {BASE_DIR} && python src/data_pipeline.py --mode process "
                 f"--input_file {arc_file} "
-                f"--output_file {PROCESSED_DIR / 'arc_processed.jsonl'} "
+                f"--output_file {arc_output} "
                 f"--source arc",
                 "Process ARC augmented data"
             )
+            # SAVE PROCESSED ARC TO DRIVE IMMEDIATELY
+            print(f"\n  [PERSIST] Saving processed ARC data to Drive...")
+            save_to_drive(arc_output, DRIVE_DIR / "data" / "processed")
 
-        # Merge
+        # Merge all processed data
+        merged_file = PROCESSED_DIR / 'zarx_pretrain.jsonl'
         run(
             f"cd {BASE_DIR} && python src/data_pipeline.py --mode merge "
             f"--processed_dir {PROCESSED_DIR} "
-            f"--output_file {PROCESSED_DIR / 'zarx_pretrain.jsonl'}",
+            f"--output_file {merged_file}",
             "Merge all processed data"
         )
-
-        # SAVE TO DRIVE
+        # SAVE MERGED DATA TO DRIVE IMMEDIATELY
+        print(f"\n  [PERSIST] Saving merged pretraining data to Drive...")
         save_to_drive(PROCESSED_DIR, DRIVE_DIR / "data", "processed")
 
     # ========== STEP 10: Train Tokenizer ==========
@@ -394,32 +426,35 @@ def main():
 
         # Check if tokenizer already on Drive
         drive_tokenizer = DRIVE_DIR / "tokenizer" / "tokenizer.json"
+        local_tokenizer = BASE_DIR / "configs" / "tokenizer.json"
+
         if drive_tokenizer.exists():
             print(f"  Found trained tokenizer on Drive! Restoring...")
-            shutil.copy2(str(drive_tokenizer), str(BASE_DIR / "configs" / "tokenizer.json"))
+            shutil.copy2(str(drive_tokenizer), str(local_tokenizer))
             print(f"  Tokenizer restored from Drive.")
         else:
             run(
                 f"cd {BASE_DIR} && python scripts/train_tokenizer.py "
                 f"--data_path {PROCESSED_DIR} "
-                f"--output_path {BASE_DIR / 'configs' / 'tokenizer.json'} "
+                f"--output_path {local_tokenizer} "
                 f"--vocab_size 32000 "
                 f"--max_lines 5000000",
                 "Train 32K BPE tokenizer on code + ARC corpus"
             )
-            # SAVE TO DRIVE
-            save_to_drive(BASE_DIR / "configs" / "tokenizer.json", DRIVE_DIR / "tokenizer")
+            # SAVE TO DRIVE IMMEDIATELY
+            print(f"\n  [PERSIST] Saving trained tokenizer to Drive...")
+            save_to_drive(local_tokenizer, DRIVE_DIR / "tokenizer")
             # PUSH TO GITHUB
             if args.github_token:
                 push_to_github(args.github_token, args.github_repo,
-                             str(BASE_DIR / "configs" / "tokenizer.json"),
-                             "add trained tokenizer")
+                             str(local_tokenizer), "add trained tokenizer")
     else:
         print("\n  Skipping tokenizer training (--skip_tokenizer)")
         # Try restore from Drive
         drive_tokenizer = DRIVE_DIR / "tokenizer" / "tokenizer.json"
         if drive_tokenizer.exists():
             shutil.copy2(str(drive_tokenizer), str(BASE_DIR / "configs" / "tokenizer.json"))
+            print("  Tokenizer restored from Drive.")
 
     # ========== STEP 11: Short Test Training Run ==========
     if not args.skip_test_train:
@@ -430,7 +465,7 @@ def main():
             print("  No tokenizer found. Skipping test training.")
         else:
             github_flags = f"--github_token {args.github_token} --github_repo {args.github_repo} " if args.github_token else ""
-            hf_flags = f"--hf_repo_id {args.hf_repo} --hf_token {args.hf_token} " if args.hf_repo and args.hf_token else ""
+            hf_flags = f"--hf_repo_id {args.hf_repo} --hf_token {args.hf_token} " if args.hf_token else ""
 
             run(
                 f"cd {BASE_DIR} && python src/train.py "
@@ -456,18 +491,30 @@ def main():
                 f"--wandb_run_name day1-test",
                 "Test training run (1000 steps)"
             )
+            # SAVE CHECKPOINTS TO DRIVE
+            print(f"\n  [PERSIST] Saving training checkpoints to Drive...")
+            save_to_drive("/content/checkpoints", DRIVE_DIR, "checkpoints")
     else:
         print("\n  Skipping test training (--skip_test_train)")
 
     # ========== FINAL SYNC TO DRIVE ==========
     step(12, "Final Sync - Save Everything to Drive")
 
-    save_to_drive(PROCESSED_DIR, DRIVE_DIR / "data", "processed")
+    # Save all data
+    if PROCESSED_DIR.exists():
+        save_to_drive(PROCESSED_DIR, DRIVE_DIR / "data", "processed")
     if (BASE_DIR / "configs" / "tokenizer.json").exists():
         save_to_drive(BASE_DIR / "configs" / "tokenizer.json", DRIVE_DIR / "tokenizer")
-    save_to_drive("/content/checkpoints", DRIVE_DIR, "checkpoints")
+    if Path("/content/checkpoints").exists():
+        save_to_drive("/content/checkpoints", DRIVE_DIR, "checkpoints")
+    # Save raw data too (saves re-downloading next time)
+    if (DATA_DIR / "raw").exists():
+        save_to_drive(DATA_DIR / "raw", DRIVE_DIR / "data", "raw")
+    # Save configs
+    if (BASE_DIR / "configs").exists():
+        save_to_drive(BASE_DIR / "configs", DRIVE_DIR, "configs")
 
-    # Push configs to GitHub
+    # Push to GitHub
     if args.github_token:
         push_to_github(args.github_token, args.github_repo,
                       str(BASE_DIR / "configs"), "sync configs after setup")
@@ -488,20 +535,20 @@ def main():
 
   PERSISTENCE - Everything is saved to Google Drive:
     Drive location: {DRIVE_DIR}
-    + data/raw/          (ProX + ARC raw data)
-    + data/processed/    (cleaned, deduped, merged data)
-    + tokenizer/         (trained 32K BPE tokenizer)
-    + checkpoints/       (training checkpoints)
-    + configs/           (model + train configs)
+    + data/raw/prox-code/  (ProX raw sharded data)
+    + data/raw/arc/        (ARC raw + augmented data)
+    + data/processed/      (cleaned, deduped, merged data)
+    + tokenizer/           (trained 32K BPE tokenizer)
+    + checkpoints/         (training checkpoints)
+    + configs/             (model + train configs)
 
   GitHub Checkpoints: {args.github_repo if args.github_token else 'not configured'}
+  HuggingFace Repo:   {args.hf_repo if args.hf_token else 'not configured'}
 
-  Next time you start Colab, the script will auto-restore from Drive.
-
-  Daily routine:
-    1. Start Colab -> mount Drive -> auto-restore -> resume training
-    2. Checkpoints: Local(100) + Drive(500) + GitHub(1000) + HF(1000)
-    3. Even if Colab dies, max data loss = ~8 minutes of training
+  Next time you start Colab:
+    1. Mount Drive:  from google.colab import drive; drive.mount('/content/drive')
+    2. Run this script again - it will auto-restore from Drive (skip downloads!)
+    3. Or just start training directly with restored data
 
   To start full pretraining:
     python src/train.py --model_config configs/model_config.json \\
@@ -511,6 +558,8 @@ def main():
       --use_8bit_adam \\
       --drive_dir {DRIVE_DIR} \\
       --github_token YOUR_GH_TOKEN \\
+      --hf_repo_id {args.hf_repo} \\
+      --hf_token YOUR_HF_TOKEN \\
       --wandb_project zarx-1b
     """)
 
