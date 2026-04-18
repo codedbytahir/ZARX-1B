@@ -1,0 +1,48 @@
+# ZARX-1B Training Configuration
+# Optimized for Google Colab T4 (16GB VRAM) and Kaggle T4/P100
+
+# Model
+model_config: configs/model_config.json
+tokenizer_path: configs/tokenizer.json
+
+# Data
+data_path: null                    # Local JSONL data path (set on Colab)
+hf_dataset: null                   # HuggingFace dataset (alternative)
+data_split: train
+text_field: text
+
+# Training
+seed: 42
+micro_batch_size: 1                # What fits in T4 VRAM
+gradient_accumulation_steps: 32    # Effective batch = 32 sequences
+# Effective tokens per step: 32 × 2048 = 65,536
+
+# Optimizer
+use_8bit_adam: true
+learning_rate: 3.0e-4
+min_lr: 1.0e-5
+warmup_steps: 2000
+weight_decay: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.95
+max_grad_norm: 1.0
+
+# Total training
+total_tokens: 10000000000          # 10B tokens target
+
+# Checkpointing
+checkpoint_dir: /content/checkpoints
+drive_dir: /content/drive/MyDrive/ZARX-1B
+hf_repo_id: null                   # Set to your HuggingFace repo
+hf_token: null                     # Set via environment variable
+save_every_local: 100
+save_every_drive: 500
+save_every_hf: 1000
+
+# Output
+output_dir: /content/zarx-1b-final
+
+# Logging
+log_every_steps: 10
+wandb_project: zarx-1b
+wandb_run_name: null

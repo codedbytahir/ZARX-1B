@@ -1,0 +1,21 @@
+{
+    "vocab_size": 32000,
+    "model_type": "BPE",
+    "min_frequency": 50,
+    "special_tokens": [
+        "<pad>",
+        "<eos>",
+        "<bos>",
+        "<unk>",
+        "<code>",
+        "</code>",
+        "<arc_input>",
+        "</arc_input>",
+        "<arc_output>",
+        "</arc_output>",
+        "<solution>",
+        "</solution>"
+    ],
+    "pre_tokenizer": "ByteLevel",
+    "add_prefix_space": false
+}

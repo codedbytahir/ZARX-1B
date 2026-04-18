@@ -1,0 +1,23 @@
+# ZARX-1B Dependencies
+# Core
+torch>=2.1.0
+datasets>=2.16.0
+tokenizers>=0.15.0
+transformers>=4.36.0
+accelerate>=0.25.0
+safetensors>=0.4.0
+
+# Training optimizations
+bitsandbytes>=0.41.0
+flash-attn>=2.5.0
+
+# Logging
+wandb>=0.16.0
+
+# Data pipeline
+huggingface_hub>=0.20.0
+datasketch>=1.6.0
+numpy>=1.24.0
+
+# Eval
+evaluate>=0.4.0
