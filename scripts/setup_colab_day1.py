@@ -96,7 +96,7 @@ def main():
     print(f"  CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"  GPU: {torch.cuda.get_device_name()}")
-        vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"  VRAM: {vram:.1f} GB")
         print(f"  BF16 supported: {torch.cuda.is_bf16_supported()}")
         if vram < 14:
