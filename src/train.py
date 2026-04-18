@@ -254,10 +254,13 @@ def train(args):
     ckpt_mgr = CheckpointManager(
         local_dir=args.checkpoint_dir,
         drive_dir=args.drive_dir,
+        github_token=args.github_token,
+        github_repo=args.github_repo,
         hf_repo_id=args.hf_repo_id,
         hf_token=args.hf_token,
         save_every_local=args.save_every_local,
         save_every_drive=args.save_every_drive,
+        save_every_github=args.save_every_github,
         save_every_hf=args.save_every_hf,
     )
 
@@ -452,8 +455,11 @@ def parse_args():
     parser.add_argument("--drive_dir", type=str, default="/content/drive/MyDrive/ZARX-1B")
     parser.add_argument("--hf_repo_id", type=str, default=None)
     parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--github_token", type=str, default=None, help="GitHub personal token for checkpoint pushes")
+    parser.add_argument("--github_repo", type=str, default="codedbytahir/zarx-checkpoints", help="GitHub checkpoint repo")
     parser.add_argument("--save_every_local", type=int, default=100)
     parser.add_argument("--save_every_drive", type=int, default=500)
+    parser.add_argument("--save_every_github", type=int, default=1000)
     parser.add_argument("--save_every_hf", type=int, default=1000)
     parser.add_argument("--output_dir", type=str, default="/content/zarx-1b-final")
 

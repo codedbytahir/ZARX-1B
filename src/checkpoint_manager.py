@@ -1,10 +1,11 @@
 """
 ZARX-1B Bulletproof Checkpoint Manager
-Triple-redundancy system: Local + Google Drive + HuggingFace Hub
+Quadruple-redundancy system: Local + Google Drive + GitHub + HuggingFace Hub
 
 Layer 1: Local disk     — every 100 steps  (fast, survives within session)
 Layer 2: Google Drive   — every 500 steps  (survives Colab restarts)
-Layer 3: HuggingFace    — every 1000 steps (survives EVERYTHING, cross-platform)
+Layer 3: GitHub Repo    — every 1000 steps (survives EVERYTHING, version controlled)
+Layer 4: HuggingFace    — every 1000 steps (cross-platform, Kaggle compatible)
 """
 
 import torch
@@ -12,6 +13,7 @@ import os
 import time
 import shutil
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -24,12 +26,14 @@ except ImportError:
 
 
 class CheckpointManager:
-    """Triple-redundancy checkpoint system for ZARX-1B training."""
+    """Quadruple-redundancy checkpoint system for ZARX-1B training."""
 
     def __init__(
         self,
         local_dir: str = "/content/checkpoints",
         drive_dir: str = "/content/drive/MyDrive/ZARX-1B",
+        github_token: str = None,
+        github_repo: str = "codedbytahir/zarx-checkpoints",
         hf_repo_id: str = None,
         hf_token: str = None,
         keep_local: int = 3,
@@ -37,10 +41,13 @@ class CheckpointManager:
         keep_hf: int = 5,
         save_every_local: int = 100,
         save_every_drive: int = 500,
+        save_every_github: int = 1000,
         save_every_hf: int = 1000,
     ):
         self.local_dir = Path(local_dir)
         self.drive_dir = Path(drive_dir)
+        self.github_token = github_token
+        self.github_repo = github_repo
         self.hf_repo_id = hf_repo_id
         self.hf_token = hf_token
         self.hf_api = None
@@ -51,6 +58,7 @@ class CheckpointManager:
 
         self.save_every_local = save_every_local
         self.save_every_drive = save_every_drive
+        self.save_every_github = save_every_github
         self.save_every_hf = save_every_hf
 
         # Create directories
@@ -60,11 +68,14 @@ class CheckpointManager:
         except Exception:
             print("[CHECKPOINT] Warning: Google Drive not mounted yet. Drive saves will be skipped.")
 
+        # Initialize GitHub checkpoint repo
+        if github_token and github_repo:
+            self._init_github_repo()
+
         # Initialize HF
         if HF_AVAILABLE and hf_repo_id and hf_token:
             try:
                 self.hf_api = HfApi(token=hf_token)
-                # Ensure repo exists
                 try:
                     self.hf_api.repo_info(repo_id=hf_repo_id, repo_type="model")
                 except Exception:
@@ -74,6 +85,34 @@ class CheckpointManager:
                 print(f"[CHECKPOINT] Warning: HF initialization failed: {e}")
                 self.hf_api = None
 
+    def _init_github_repo(self):
+        """Clone or init the GitHub checkpoint repo."""
+        try:
+            self.github_local = Path("/content/zarx-checkpoints")
+            auth_url = f"https://{self.github_token}@github.com/{self.github_repo}.git"
+
+            if self.github_local.exists():
+                print(f"[CHECKPOINT] GitHub checkpoint repo already cloned at {self.github_local}")
+            else:
+                result = subprocess.run(
+                    ["git", "clone", auth_url, str(self.github_local)],
+                    capture_output=True, text=True, timeout=60
+                )
+                if result.returncode == 0:
+                    print(f"[CHECKPOINT] Cloned GitHub checkpoint repo: {self.github_repo}")
+                else:
+                    # Repo might not exist yet, create it locally
+                    self.github_local.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(["git", "init"], cwd=str(self.github_local), capture_output=True)
+                    subprocess.run(
+                        ["git", "remote", "add", "origin", auth_url],
+                        cwd=str(self.github_local), capture_output=True
+                    )
+                    print(f"[CHECKPOINT] Created local GitHub checkpoint dir")
+        except Exception as e:
+            print(f"[CHECKPOINT] Warning: GitHub repo init failed: {e}")
+            self.github_token = None  # Disable GitHub pushes
+
     def should_save(self, step: int) -> list:
         """Determine which layers need saving at this step."""
         layers = []
@@ -81,6 +120,8 @@ class CheckpointManager:
             layers.append("local")
         if step % self.save_every_drive == 0 and step > 0:
             layers.append("drive")
+        if step % self.save_every_github == 0 and step > 0:
+            layers.append("github")
         if step % self.save_every_hf == 0 and step > 0:
             layers.append("hf")
         return layers
@@ -142,20 +183,32 @@ class CheckpointManager:
         if "drive" in layers:
             print(f"[CHECKPOINT] Copying to Google Drive...")
             try:
-                drive_path = self.drive_dir / filename
-                drive_latest = self.drive_dir / "checkpoint-latest.pt"
-                drive_meta = self.drive_dir / "training_metadata.json"
+                drive_ckpt_dir = self.drive_dir / "checkpoints"
+                drive_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+                drive_path = drive_ckpt_dir / filename
+                drive_latest = drive_ckpt_dir / "checkpoint-latest.pt"
+                drive_meta = drive_ckpt_dir / "training_metadata.json"
 
                 shutil.copy2(local_path, drive_path)
                 shutil.copy2(local_path, drive_latest)
                 shutil.copy2(meta_path, drive_meta)
 
-                self._cleanup_dir(self.drive_dir, self.keep_drive)
+                self._cleanup_dir(drive_ckpt_dir, self.keep_drive)
                 print(f"[CHECKPOINT] Drive save complete.")
             except Exception as e:
                 print(f"[CHECKPOINT] Warning: Drive save failed: {e}")
 
-        # === LAYER 3: HUGGINGFACE HUB ===
+        # === LAYER 3: GITHUB REPO ===
+        if "github" in layers and self.github_token and self.github_repo:
+            print(f"[CHECKPOINT] Pushing to GitHub ({self.github_repo})...")
+            try:
+                self._push_to_github(local_path, filename, meta)
+            except Exception as e:
+                print(f"[CHECKPOINT] Warning: GitHub push failed: {e}")
+                print(f"[CHECKPOINT] Local + Drive copies are safe. Will retry next cycle.")
+
+        # === LAYER 4: HUGGINGFACE HUB ===
         if "hf" in layers and self.hf_api:
             print(f"[CHECKPOINT] Pushing to HuggingFace Hub...")
             try:
@@ -181,14 +234,127 @@ class CheckpointManager:
                 print(f"[CHECKPOINT] HF Hub push complete!")
             except Exception as e:
                 print(f"[CHECKPOINT] Warning: HF push failed: {e}")
-                print(f"[CHECKPOINT] Local + Drive copies are safe. Will retry next cycle.")
+                print(f"[CHECKPOINT] Local + Drive + GitHub copies are safe. Will retry next cycle.")
 
         # Cleanup local
         self._cleanup_dir(self.local_dir, self.keep_local)
         print(f"[CHECKPOINT] Step {step} saved successfully.")
 
+    def _push_to_github(self, local_path: Path, filename: str, meta: dict):
+        """Push checkpoint file to GitHub repo."""
+        github_dir = getattr(self, 'github_local', None)
+        if not github_dir or not github_dir.exists():
+            print(f"[CHECKPOINT] GitHub local dir not found, skipping push.")
+            return
+
+        # Copy checkpoint file
+        dest = github_dir / filename
+        shutil.copy2(local_path, dest)
+
+        # Also copy latest pointer
+        shutil.copy2(local_path, github_dir / "checkpoint-latest.pt")
+
+        # Save metadata
+        meta_dest = github_dir / "training_metadata.json"
+        with open(meta_dest, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        # Git add, commit, push
+        auth_url = f"https://{self.github_token}@github.com/{self.github_repo}.git"
+
+        subprocess.run(["git", "config", "user.email", "zarx-1b@training.bot"], cwd=str(github_dir), capture_output=True)
+        subprocess.run(["git", "config", "user.name", "ZARX-1B Bot"], cwd=str(github_dir), capture_output=True)
+        subprocess.run(["git", "add", "-A"], cwd=str(github_dir), capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"checkpoint step {meta['latest_step']} | loss {meta['train_loss']:.4f} | tokens {meta['total_tokens']/1e9:.2f}B"],
+            cwd=str(github_dir), capture_output=True
+        )
+
+        # Force push or regular push
+        result = subprocess.run(
+            ["git", "push", "origin", "main"],
+            cwd=str(github_dir), capture_output=True, text=True, timeout=120
+        )
+
+        if result.returncode != 0:
+            # Try setting the URL and retry
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", auth_url],
+                cwd=str(github_dir), capture_output=True
+            )
+            result = subprocess.run(
+                ["git", "push", "-u", "origin", "main"],
+                cwd=str(github_dir), capture_output=True, text=True, timeout=120
+            )
+
+        if result.returncode == 0:
+            print(f"[CHECKPOINT] GitHub push complete! ({filename})")
+            # Cleanup old checkpoints on GitHub (keep only latest few)
+            self._cleanup_github()
+        else:
+            print(f"[CHECKPOINT] GitHub push failed: {result.stderr[:200]}")
+
+    def _cleanup_github(self, keep: int = 3):
+        """Remove old checkpoint files from GitHub local, keeping only N most recent."""
+        github_dir = getattr(self, 'github_local', None)
+        if not github_dir or not github_dir.exists():
+            return
+
+        checkpoints = []
+        for f in github_dir.glob("checkpoint-step-*.pt"):
+            try:
+                step = int(f.name.split("-")[-1].replace(".pt", ""))
+                checkpoints.append((step, f))
+            except ValueError:
+                continue
+
+        checkpoints.sort(reverse=True)
+        for step, path in checkpoints[keep:]:
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+    def save_data_to_drive(self, data_dir: str, label: str = "data"):
+        """Save entire data directory to Google Drive for persistence."""
+        try:
+            drive_data_dir = self.drive_dir / label
+            if Path(data_dir).exists():
+                shutil.copytree(data_dir, str(drive_data_dir), dirs_exist_ok=True)
+                print(f"[PERSIST] Saved {data_dir} → Google Drive ({label})")
+                return True
+        except Exception as e:
+            print(f"[PERSIST] Warning: Could not save {label} to Drive: {e}")
+        return False
+
+    def save_file_to_drive(self, filepath: str, label: str = ""):
+        """Save a single file to Google Drive."""
+        try:
+            src = Path(filepath)
+            if src.exists():
+                dest = self.drive_dir / label / src.name if label else self.drive_dir / src.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dest))
+                print(f"[PERSIST] Saved {src.name} → Google Drive")
+                return True
+        except Exception as e:
+            print(f"[PERSIST] Warning: Could not save {filepath} to Drive: {e}")
+        return False
+
+    def restore_from_drive(self, data_dir: str, label: str = "data"):
+        """Restore data directory from Google Drive."""
+        try:
+            drive_data_dir = self.drive_dir / label
+            if drive_data_dir.exists():
+                shutil.copytree(str(drive_data_dir), data_dir, dirs_exist_ok=True)
+                print(f"[RESTORE] Restored {label} from Google Drive → {data_dir}")
+                return True
+        except Exception as e:
+            print(f"[RESTORE] Warning: Could not restore {label} from Drive: {e}")
+        return False
+
     def load_latest(self) -> Optional[Dict]:
-        """Load the latest checkpoint, trying all three layers."""
+        """Load the latest checkpoint, trying all four layers."""
 
         # Try Layer 1: Local
         ckpt = self._try_load_from_dir(self.local_dir)
@@ -197,12 +363,21 @@ class CheckpointManager:
             return ckpt
 
         # Try Layer 2: Google Drive
-        ckpt = self._try_load_from_dir(self.drive_dir)
-        if ckpt:
-            print(f"[RESUME] Loaded from GOOGLE DRIVE (step {ckpt['step']})")
-            return ckpt
+        drive_ckpt_dir = self.drive_dir / "checkpoints"
+        if drive_ckpt_dir.exists():
+            ckpt = self._try_load_from_dir(drive_ckpt_dir)
+            if ckpt:
+                print(f"[RESUME] Loaded from GOOGLE DRIVE (step {ckpt['step']})")
+                return ckpt
 
-        # Try Layer 3: HuggingFace Hub
+        # Try Layer 3: GitHub
+        if self.github_token and self.github_repo:
+            ckpt = self._try_load_github()
+            if ckpt:
+                print(f"[RESUME] Loaded from GITHUB (step {ckpt['step']})")
+                return ckpt
+
+        # Try Layer 4: HuggingFace Hub
         if self.hf_api and self.hf_repo_id:
             ckpt = self._try_load_hf()
             if ckpt:
@@ -244,6 +419,23 @@ class CheckpointManager:
             except Exception:
                 continue
         return None
+
+    def _try_load_github(self) -> Optional[Dict]:
+        """Try loading from GitHub checkpoint repo."""
+        github_dir = getattr(self, 'github_local', None)
+        if not github_dir or not github_dir.exists():
+            return None
+
+        # Pull latest first
+        try:
+            subprocess.run(
+                ["git", "pull", "origin", "main"],
+                cwd=str(github_dir), capture_output=True, timeout=30
+            )
+        except Exception:
+            pass
+
+        return self._try_load_from_dir(github_dir)
 
     def _try_load_hf(self) -> Optional[Dict]:
         """Try loading from HuggingFace Hub."""
@@ -335,7 +527,7 @@ class CheckpointManager:
             print(f"[CLEANUP] HF cleanup failed: {e}")
 
     def emergency_recover(self) -> Optional[Dict]:
-        """Scan ALL three layers and find the most advanced checkpoint."""
+        """Scan ALL four layers and find the most advanced checkpoint."""
         print("[EMERGENCY] Scanning all storage layers for checkpoints...")
         candidates = []
 
@@ -348,12 +540,31 @@ class CheckpointManager:
                 pass
 
         # Scan Drive
-        for f in self.drive_dir.glob("checkpoint-step-*.pt"):
+        drive_ckpt_dir = self.drive_dir / "checkpoints"
+        if drive_ckpt_dir.exists():
+            for f in drive_ckpt_dir.glob("checkpoint-step-*.pt"):
+                try:
+                    step = int(f.name.split("-")[-1].replace(".pt", ""))
+                    candidates.append(("drive", step, f))
+                except ValueError:
+                    pass
+
+        # Scan GitHub
+        github_dir = getattr(self, 'github_local', None)
+        if github_dir and github_dir.exists():
             try:
-                step = int(f.name.split("-")[-1].replace(".pt", ""))
-                candidates.append(("drive", step, f))
-            except ValueError:
+                subprocess.run(
+                    ["git", "pull", "origin", "main"],
+                    cwd=str(github_dir), capture_output=True, timeout=30
+                )
+            except Exception:
                 pass
+            for f in github_dir.glob("checkpoint-step-*.pt"):
+                try:
+                    step = int(f.name.split("-")[-1].replace(".pt", ""))
+                    candidates.append(("github", step, f))
+                except ValueError:
+                    pass
 
         # Scan HF
         if self.hf_api and self.hf_repo_id:
